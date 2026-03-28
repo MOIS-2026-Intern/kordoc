@@ -147,13 +147,18 @@ import type { IRBlock, IRTable, IRCell, CellContext } from "kordoc"
 
 ## Security
 
-v0.2.1 includes the following security hardening:
+v0.2.2 security hardening (cumulative since v0.2.1):
 
 - **ZIP bomb protection** — 100MB decompression limit, 500 entry cap
-- **XXE prevention** — DOCTYPE declarations stripped from HWPX XML
-- **Decompression bomb guard** — `maxOutputLength` on HWP5 zlib streams
+- **XXE/Billion Laughs prevention** — Internal DTD subsets fully stripped from HWPX XML
+- **Decompression bomb guard** — `maxOutputLength` on HWP5 zlib streams, cumulative 100MB limit across sections
+- **colSpan/rowSpan clamping** — Crafted merge values clamped to grid bounds (MAX_COLS=200, MAX_ROWS=10,000)
+- **Broken ZIP path traversal guard** — `..` and absolute path entries rejected, filename length capped
 - **MCP path restriction** — Only `.hwp`, `.hwpx`, `.pdf` extensions allowed
-- **Table memory guard** — 10,000 row cap on table builder
+- **File size limit** — 500MB max in MCP server and CLI
+- **PDF resource cleanup** — `doc.destroy()` prevents WASM memory leaks
+- **Table memory guard** — Sparse Set-based allocation in Pass 1, 10,000 row cap
+- **HWP5 section limit** — Max 100 sections to prevent infinite loop on corrupted files
 
 ## How It Works
 

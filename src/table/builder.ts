@@ -3,33 +3,34 @@
 import type { CellContext, IRBlock, IRCell, IRTable } from "../types.js"
 
 /** 테이블 열 수 상한 — 한국 공공문서 기준 충분한 값 */
-const MAX_COLS = 200
+export const MAX_COLS = 200
 /** 테이블 행 수 상한 — 메모리 폭주 방지 */
-const MAX_ROWS = 10000
+export const MAX_ROWS = 10000
 
 export function buildTable(rows: CellContext[][]): IRTable {
   if (rows.length > MAX_ROWS) rows = rows.slice(0, MAX_ROWS)
   const numRows = rows.length
 
-  // Pass 1: maxCols 계산
-  const tempOccupied: boolean[][] = Array.from({ length: numRows }, () => Array(MAX_COLS).fill(false))
+  // Pass 1: maxCols 계산 (sparse Set — 메모리 효율적)
+  const tempOccupied = new Set<number>()
   let maxCols = 0
 
   for (let rowIdx = 0; rowIdx < numRows; rowIdx++) {
     let colIdx = 0
     for (const cell of rows[rowIdx]) {
-      while (colIdx < MAX_COLS && tempOccupied[rowIdx][colIdx]) colIdx++
+      while (colIdx < MAX_COLS && tempOccupied.has(rowIdx * MAX_COLS + colIdx)) colIdx++
       if (colIdx >= MAX_COLS) break
 
       for (let r = rowIdx; r < Math.min(rowIdx + cell.rowSpan, numRows); r++) {
         for (let c = colIdx; c < Math.min(colIdx + cell.colSpan, MAX_COLS); c++) {
-          tempOccupied[r][c] = true
+          tempOccupied.add(r * MAX_COLS + c)
         }
       }
       colIdx += cell.colSpan
       if (colIdx > maxCols) maxCols = colIdx
     }
   }
+  tempOccupied.clear()
 
   if (maxCols === 0) return { rows: 0, cols: 0, cells: [], hasHeader: false }
 

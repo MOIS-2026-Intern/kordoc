@@ -1,6 +1,6 @@
 /** kordoc CLI — 모두 파싱해버리겠다 */
 
-import { readFileSync, writeFileSync, mkdirSync } from "fs"
+import { readFileSync, writeFileSync, mkdirSync, statSync } from "fs"
 import { basename, resolve } from "path"
 import { Command } from "commander"
 import { parse, detectFormat } from "./index.js"
@@ -23,6 +23,12 @@ program
       const fileName = basename(absPath)
 
       try {
+        const fileSize = statSync(absPath).size
+        if (fileSize > 500 * 1024 * 1024) {
+          process.stderr.write(`\n[kordoc] SKIP: ${fileName} — 파일이 너무 큽니다 (${(fileSize / 1024 / 1024).toFixed(1)}MB)\n`)
+          process.exitCode = 1
+          continue
+        }
         const buffer = readFileSync(absPath)
         const arrayBuffer = toArrayBuffer(buffer)
         const format = detectFormat(arrayBuffer)
@@ -51,7 +57,8 @@ program
           if (!opts.silent) process.stderr.write(`  → ${opts.output}\n`)
         } else if (opts.outDir) {
           mkdirSync(opts.outDir, { recursive: true })
-          const outPath = resolve(opts.outDir, fileName.replace(/\.[^.]+$/, ".md"))
+          const outExt = opts.format === "json" ? ".json" : ".md"
+          const outPath = resolve(opts.outDir, fileName.replace(/\.[^.]+$/, outExt))
           writeFileSync(outPath, output, "utf-8")
           if (!opts.silent) process.stderr.write(`  → ${outPath}\n`)
         } else {

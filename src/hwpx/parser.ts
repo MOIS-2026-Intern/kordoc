@@ -7,7 +7,7 @@
 import JSZip from "jszip"
 import { inflateRawSync } from "zlib"
 import { DOMParser } from "@xmldom/xmldom"
-import { buildTable, convertTableToText, blocksToMarkdown } from "../table/builder.js"
+import { buildTable, convertTableToText, blocksToMarkdown, MAX_COLS, MAX_ROWS } from "../table/builder.js"
 import type { CellContext, IRBlock } from "../types.js"
 
 /** 압축 해제 최대 크기 (100MB) — ZIP bomb 방지 */
@@ -15,11 +15,16 @@ const MAX_DECOMPRESS_SIZE = 100 * 1024 * 1024
 /** 손상 ZIP 복구 시 최대 엔트리 수 */
 const MAX_ZIP_ENTRIES = 500
 
+/** colSpan/rowSpan을 안전한 범위로 클램핑 */
+function clampSpan(val: number, max: number): number {
+  return Math.max(1, Math.min(val, max))
+}
+
 interface TableState { rows: CellContext[][]; currentRow: CellContext[]; cell: CellContext | null }
 
-/** XXE/Billion Laughs 방지 — DOCTYPE 제거 */
+/** XXE/Billion Laughs 방지 — DOCTYPE 제거 (내부 DTD 서브셋 포함) */
 function stripDtd(xml: string): string {
-  return xml.replace(/<!DOCTYPE[^>]*>/gi, "")
+  return xml.replace(/<!DOCTYPE\s[^[>]*(\[[\s\S]*?\])?\s*>/gi, "")
 }
 
 export async function parseHwpxDocument(buffer: ArrayBuffer): Promise<string> {
@@ -69,6 +74,9 @@ function extractFromBrokenZip(buffer: ArrayBuffer): string {
     const nameLen = view.getUint16(pos + 26, true)
     const extraLen = view.getUint16(pos + 28, true)
 
+    // nameLen 상한 — 비정상 값에 의한 대규모 버퍼 할당 방지
+    if (nameLen > 1024 || extraLen > 65535) { pos += 30 + nameLen + extraLen; continue }
+
     const fileStart = pos + 30 + nameLen + extraLen
     // 범위 초과 검증 — OOB 및 무한 루프 방지
     if (fileStart + compSize > data.length) break
@@ -76,6 +84,9 @@ function extractFromBrokenZip(buffer: ArrayBuffer): string {
 
     const nameBytes = data.slice(pos + 30, pos + 30 + nameLen)
     const name = new TextDecoder().decode(nameBytes)
+
+    // 경로 순회 방지 — 상위 디렉토리 참조 차단
+    if (name.includes("..") || name.startsWith("/")) { pos = fileStart + compSize; continue }
     const fileData = data.slice(fileStart, fileStart + compSize)
     pos = fileStart + compSize
 
@@ -228,8 +239,8 @@ function walkSection(
         if (tableCtx?.cell) {
           const cs = parseInt(el.getAttribute("colSpan") || "1", 10)
           const rs = parseInt(el.getAttribute("rowSpan") || "1", 10)
-          if (cs > 0) tableCtx.cell.colSpan = cs
-          if (rs > 0) tableCtx.cell.rowSpan = rs
+          tableCtx.cell.colSpan = clampSpan(cs, MAX_COLS)
+          tableCtx.cell.rowSpan = clampSpan(rs, MAX_ROWS)
         }
         break
 

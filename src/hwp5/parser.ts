@@ -6,7 +6,7 @@ import {
   FLAG_COMPRESSED, FLAG_ENCRYPTED, FLAG_DRM,
   type HwpRecord,
 } from "./record.js"
-import { buildTable, blocksToMarkdown } from "../table/builder.js"
+import { buildTable, blocksToMarkdown, MAX_COLS, MAX_ROWS } from "../table/builder.js"
 import type { CellContext, IRBlock } from "../types.js"
 
 import { createRequire } from "module"
@@ -19,6 +19,11 @@ interface CfbModule {
   parse(data: Buffer): CfbContainer
   find(cfb: CfbContainer, path: string): CfbEntry | null
 }
+
+/** 최대 섹션 수 — 비정상 파일에 의한 무한 루프 방지 */
+const MAX_SECTIONS = 100
+/** 누적 압축 해제 최대 크기 (100MB) */
+const MAX_TOTAL_DECOMPRESS = 100 * 1024 * 1024
 
 export function parseHwp5Document(buffer: Buffer): string {
   const cfb = CFB.parse(buffer)
@@ -35,8 +40,11 @@ export function parseHwp5Document(buffer: Buffer): string {
   if (sections.length === 0) throw new Error("섹션 스트림을 찾을 수 없습니다")
 
   const blocks: IRBlock[] = []
+  let totalDecompressed = 0
   for (const sectionData of sections) {
     const data = compressed ? decompressStream(Buffer.from(sectionData)) : Buffer.from(sectionData)
+    totalDecompressed += data.length
+    if (totalDecompressed > MAX_TOTAL_DECOMPRESS) throw new Error("총 압축 해제 크기 초과 (decompression bomb 의심)")
     const records = readRecords(data)
     blocks.push(...parseSection(records))
   }
@@ -47,7 +55,7 @@ export function parseHwp5Document(buffer: Buffer): string {
 function findSections(cfb: CfbContainer): Buffer[] {
   const sections: Array<{ idx: number; content: Buffer }> = []
 
-  for (let i = 0; ; i++) {
+  for (let i = 0; i < MAX_SECTIONS; i++) {
     const entry = CFB.find(cfb, `/BodyText/Section${i}`)
     if (!entry?.content) break
     sections.push({ idx: i, content: Buffer.from(entry.content) })
@@ -169,8 +177,8 @@ function parseCellBlock(records: HwpRecord[], startIdx: number, tableLevel: numb
   if (rec.data.length >= 14) {
     const cs = rec.data.readUInt16LE(10)
     const rs = rec.data.readUInt16LE(12)
-    if (cs > 0) colSpan = cs
-    if (rs > 0) rowSpan = rs
+    if (cs > 0) colSpan = Math.min(cs, MAX_COLS)
+    if (rs > 0) rowSpan = Math.min(rs, MAX_ROWS)
   }
 
   let i = startIdx + 1

@@ -13,6 +13,7 @@ interface PdfjsModule {
 interface PdfjsDocument {
   numPages: number
   getPage: (n: number) => Promise<PdfjsPage>
+  destroy: () => Promise<void>
 }
 interface PdfjsPage {
   getTextContent: () => Promise<{ items: PdfjsTextItem[] }>
@@ -65,46 +66,50 @@ export async function parsePdfDocument(buffer: ArrayBuffer): Promise<ParseResult
     isEvalSupported: false,
   }).promise
 
-  const pageCount = doc.numPages
-  if (pageCount === 0) {
-    return { success: false, fileType: "pdf", pageCount: 0, error: "PDF에 페이지가 없습니다." }
-  }
-
-  const pageTexts: string[] = []
-  let totalChars = 0
-
-  for (let i = 1; i <= pageCount; i++) {
-    const page = await doc.getPage(i)
-    const textContent = await page.getTextContent()
-    const lines = groupTextItemsByLine(textContent.items)
-    const pageText = lines.join("\n")
-    totalChars += pageText.replace(/\s/g, "").length
-    pageTexts.push(pageText)
-  }
-
-  const avgCharsPerPage = totalChars / pageCount
-  if (avgCharsPerPage < 10) {
-    return {
-      success: false,
-      fileType: "pdf",
-      pageCount,
-      isImageBased: true,
-      error: `이미지 기반 PDF로 추정됩니다 (${pageCount}페이지, 추출 텍스트 ${totalChars}자).`,
+  try {
+    const pageCount = doc.numPages
+    if (pageCount === 0) {
+      return { success: false, fileType: "pdf", pageCount: 0, error: "PDF에 페이지가 없습니다." }
     }
-  }
 
-  let markdown = ""
-  for (let i = 0; i < pageTexts.length; i++) {
-    const cleaned = cleanPdfText(pageTexts[i])
-    if (cleaned.trim()) {
-      if (i > 0 && markdown) markdown += "\n\n"
-      markdown += cleaned
+    const pageTexts: string[] = []
+    let totalChars = 0
+
+    for (let i = 1; i <= pageCount; i++) {
+      const page = await doc.getPage(i)
+      const textContent = await page.getTextContent()
+      const lines = groupTextItemsByLine(textContent.items)
+      const pageText = lines.join("\n")
+      totalChars += pageText.replace(/\s/g, "").length
+      pageTexts.push(pageText)
     }
+
+    const avgCharsPerPage = totalChars / pageCount
+    if (avgCharsPerPage < 10) {
+      return {
+        success: false,
+        fileType: "pdf",
+        pageCount,
+        isImageBased: true,
+        error: `이미지 기반 PDF로 추정됩니다 (${pageCount}페이지, 추출 텍스트 ${totalChars}자).`,
+      }
+    }
+
+    let markdown = ""
+    for (let i = 0; i < pageTexts.length; i++) {
+      const cleaned = cleanPdfText(pageTexts[i])
+      if (cleaned.trim()) {
+        if (i > 0 && markdown) markdown += "\n\n"
+        markdown += cleaned
+      }
+    }
+
+    markdown = reconstructTables(markdown)
+
+    return { success: true, fileType: "pdf", markdown, pageCount, isImageBased: false }
+  } finally {
+    await doc.destroy().catch(() => {})
   }
-
-  markdown = reconstructTables(markdown)
-
-  return { success: true, fileType: "pdf", markdown, pageCount, isImageBased: false }
 }
 
 // ─── 텍스트 아이템 → 행 그룹핑 ──────────────────────

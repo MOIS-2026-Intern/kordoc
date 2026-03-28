@@ -3,13 +3,15 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod"
-import { readFileSync, realpathSync, openSync, readSync, closeSync } from "fs"
+import { readFileSync, realpathSync, openSync, readSync, closeSync, statSync } from "fs"
 import { resolve, isAbsolute, extname } from "path"
 import { parse, detectFormat } from "./index.js"
 import { VERSION, toArrayBuffer } from "./utils.js"
 
 /** 허용 파일 확장자 */
 const ALLOWED_EXTENSIONS = new Set([".hwp", ".hwpx", ".pdf"])
+/** 최대 파일 크기 (500MB) */
+const MAX_FILE_SIZE = 500 * 1024 * 1024
 
 /** 경로 정규화 및 보안 검증 */
 function safePath(filePath: string): string {
@@ -38,6 +40,13 @@ server.tool(
   async ({ file_path }) => {
     try {
       const resolved = safePath(file_path)
+      const fileSize = statSync(resolved).size
+      if (fileSize > MAX_FILE_SIZE) {
+        return {
+          content: [{ type: "text", text: `파일이 너무 큽니다: ${(fileSize / 1024 / 1024).toFixed(1)}MB (최대 ${MAX_FILE_SIZE / 1024 / 1024}MB)` }],
+          isError: true,
+        }
+      }
       const buffer = readFileSync(resolved)
       const arrayBuffer = toArrayBuffer(buffer)
       const format = detectFormat(arrayBuffer)
@@ -89,9 +98,13 @@ server.tool(
       const resolved = safePath(file_path)
       // 전체 파일 대신 첫 16바이트만 읽기 — 대용량 파일 OOM 방지
       const fd = openSync(resolved, "r")
-      const headerBuf = Buffer.alloc(16)
-      readSync(fd, headerBuf, 0, 16, 0)
-      closeSync(fd)
+      let headerBuf: Buffer
+      try {
+        headerBuf = Buffer.alloc(16)
+        readSync(fd, headerBuf, 0, 16, 0)
+      } finally {
+        closeSync(fd)
+      }
       const header = toArrayBuffer(headerBuf)
       const format = detectFormat(header)
       return {
@@ -113,4 +126,4 @@ async function main() {
   await server.connect(transport)
 }
 
-main().catch(console.error)
+main().catch((err) => { console.error(err); process.exit(1) })
