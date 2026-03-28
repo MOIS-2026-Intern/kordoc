@@ -14,7 +14,8 @@
   "module": "./dist/index.mjs",
   "types": "./dist/index.d.ts",
   "bin": {
-    "kordoc": "./dist/cli.mjs"
+    "kordoc": "./dist/cli.mjs",
+    "kordoc-mcp": "./dist/mcp.mjs"
   },
   "files": [
     "dist"
@@ -34,7 +35,9 @@
     "parser",
     "pdf",
     "markdown",
-    "converter"
+    "converter",
+    "mcp",
+    "model-context-protocol"
   ],
   "author": "chrisryugj",
   "license": "MIT",
@@ -46,6 +49,7 @@
     "node": ">=18"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.28.0",
     "@xmldom/xmldom": "^0.9.8",
     "cfb": "^1.2.2",
     "commander": "^13.0.0",

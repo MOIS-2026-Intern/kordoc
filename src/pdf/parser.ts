@@ -2,14 +2,29 @@
 
 import type { ParseResult } from "../types.js"
 
-export async function parsePdfDocument(buffer: ArrayBuffer): Promise<ParseResult> {
-  // pdfjs-dist 동적 import (선택적 의존성)
-  let getDocument: any, GlobalWorkerOptions: any
+import { createRequire } from "module"
+import { pathToFileURL } from "url"
+
+// pdfjs-dist는 external로 빌드됨 — 설치 안 되어 있으면 런타임에 잡힘
+let pdfjsModule: any = null
+
+async function loadPdfjs() {
+  if (pdfjsModule) return pdfjsModule
   try {
-    const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs")
-    getDocument = pdfjs.getDocument
-    GlobalWorkerOptions = pdfjs.GlobalWorkerOptions
+    pdfjsModule = await import("pdfjs-dist/legacy/build/pdf.mjs")
+    // 워커 경로를 file:// URL로 설정 (Node.js ESM 환경 필수)
+    const req = createRequire(import.meta.url)
+    const workerPath = req.resolve("pdfjs-dist/legacy/build/pdf.worker.mjs")
+    pdfjsModule.GlobalWorkerOptions.workerSrc = pathToFileURL(workerPath).href
+    return pdfjsModule
   } catch {
+    return null
+  }
+}
+
+export async function parsePdfDocument(buffer: ArrayBuffer): Promise<ParseResult> {
+  const pdfjs = await loadPdfjs()
+  if (!pdfjs) {
     return {
       success: false,
       fileType: "pdf",
@@ -18,15 +33,14 @@ export async function parsePdfDocument(buffer: ArrayBuffer): Promise<ParseResult
     }
   }
 
-  GlobalWorkerOptions.workerSrc = ""
-
   try {
     const data = new Uint8Array(buffer)
-    const doc = await getDocument({
+    const doc = await pdfjs.getDocument({
       data,
       useSystemFonts: true,
       disableFontFace: true,
       isEvalSupported: false,
+      workerSrc: "",
     }).promise
 
     const pageCount = doc.numPages

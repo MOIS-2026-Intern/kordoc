@@ -9,7 +9,8 @@ import {
 import { buildTable, blocksToMarkdown } from "../table/builder.js"
 import type { CellContext, IRBlock } from "../types.js"
 
-// eslint-disable-next-line @typescript-eslint/no-require-imports
+import { createRequire } from "module"
+const require = createRequire(import.meta.url)
 const CFB = require("cfb")
 
 export function parseHwp5Document(buffer: Buffer): string {
