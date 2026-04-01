@@ -7,7 +7,7 @@ import {
   type HwpRecord, type HwpDocInfo, type HwpCharShape,
 } from "./record.js"
 import { buildTable, blocksToMarkdown, MAX_COLS, MAX_ROWS } from "../table/builder.js"
-import type { CellContext, IRBlock, DocumentMetadata, InternalParseResult, ParseOptions, ParseWarning, OutlineItem, InlineStyle } from "../types.js"
+import type { CellContext, IRBlock, DocumentMetadata, InternalParseResult, ParseOptions, ParseWarning, OutlineItem, InlineStyle, ExtractedImage } from "../types.js"
 import { KordocError } from "../utils.js"
 import { parsePageRange } from "../page-range.js"
 
@@ -54,19 +54,31 @@ export function parseHwp5Document(buffer: Buffer, options?: ParseOptions): Inter
 
   // 페이지 범위 필터링 (섹션 단위 근사치)
   const pageFilter = options?.pages ? parsePageRange(options.pages, sections.length) : null
+  const totalTarget = pageFilter ? pageFilter.size : sections.length
 
   const blocks: IRBlock[] = []
   let totalDecompressed = 0
+  let parsedSections = 0
   for (let si = 0; si < sections.length; si++) {
     if (pageFilter && !pageFilter.has(si + 1)) continue
-    const sectionData = sections[si]
-    const data = compressed ? decompressStream(Buffer.from(sectionData)) : Buffer.from(sectionData)
-    totalDecompressed += data.length
-    if (totalDecompressed > MAX_TOTAL_DECOMPRESS) throw new KordocError("총 압축 해제 크기 초과 (decompression bomb 의심)")
-    const records = readRecords(data)
-    const sectionBlocks = parseSection(records, docInfo, warnings, si + 1)
-    blocks.push(...sectionBlocks)
+    try {
+      const sectionData = sections[si]
+      const data = compressed ? decompressStream(Buffer.from(sectionData)) : Buffer.from(sectionData)
+      totalDecompressed += data.length
+      if (totalDecompressed > MAX_TOTAL_DECOMPRESS) throw new KordocError("총 압축 해제 크기 초과 (decompression bomb 의심)")
+      const records = readRecords(data)
+      const sectionBlocks = parseSection(records, docInfo, warnings, si + 1)
+      blocks.push(...sectionBlocks)
+      parsedSections++
+      options?.onProgress?.(parsedSections, totalTarget)
+    } catch (secErr) {
+      if (secErr instanceof KordocError) throw secErr
+      warnings.push({ page: si + 1, message: `섹션 ${si + 1} 파싱 실패: ${secErr instanceof Error ? secErr.message : "알 수 없는 오류"}`, code: "PARTIAL_PARSE" })
+    }
   }
+
+  // BinData에서 이미지 추출
+  const images = extractHwp5Images(cfb, blocks, compressed, warnings)
 
   // 스타일 기반 헤딩 감지
   if (docInfo) {
@@ -79,7 +91,7 @@ export function parseHwp5Document(buffer: Buffer, options?: ParseOptions): Inter
     .map(b => ({ level: b.level!, text: b.text!, pageNumber: b.pageNumber }))
 
   const markdown = blocksToMarkdown(blocks)
-  return { markdown, blocks, metadata, outline: outline.length > 0 ? outline : undefined, warnings: warnings.length > 0 ? warnings : undefined }
+  return { markdown, blocks, metadata, outline: outline.length > 0 ? outline : undefined, warnings: warnings.length > 0 ? warnings : undefined, images: images.length > 0 ? images : undefined }
 }
 
 /** DocInfo 스트림 파싱 (best-effort) */
@@ -252,6 +264,108 @@ function findSections(cfb: CfbContainer): Buffer[] {
   return sections.sort((a, b) => a.idx - b.idx).map(s => s.content)
 }
 
+// ─── BinData 이미지 추출 ────────────────────────────
+
+/** SHAPE_COMPONENT 태그 — HWP5 스펙 */
+const TAG_SHAPE_COMPONENT = 0x004a
+
+/** gso 제어 뒤의 하위 레코드에서 binDataId 추출 (best-effort) */
+function extractBinDataId(records: HwpRecord[], ctrlIdx: number): number {
+  const ctrlLevel = records[ctrlIdx].level
+  // CTRL_HEADER 이후의 하위 레코드들을 순회
+  for (let j = ctrlIdx + 1; j < records.length && j < ctrlIdx + 50; j++) {
+    const r = records[j]
+    if (r.level <= ctrlLevel) break // 같은/상위 레벨이면 이 제어 블록 끝
+    // SHAPE_COMPONENT에서 picture 타입이면 binDataId 추출
+    // picture 데이터는 SHAPE_COMPONENT 뒤에 오는 하위 레코드에 있음
+    // HWP5에서 그림 정보는 level이 높은 하위 레코드에 binDataId가 uint16LE로 저장
+    if (r.data.length >= 2) {
+      // 매직바이트로 이미지인지 확인하는 대신, SHAPE_COMPONENT 뒤의 하위 레코드에서 binDataId를 읽음
+      // HWP5 picture 구조: CTRL_HEADER(gso) → LIST_HEADER → SHAPE_COMPONENT → [picture data record]
+      // picture data record에서 offset 0부터 uint16LE = binDataId
+      if (r.tagId > TAG_SHAPE_COMPONENT && r.level > ctrlLevel + 1 && r.data.length >= 4) {
+        const possibleId = r.data.readUInt16LE(0)
+        if (possibleId < 10000) return possibleId // 합리적 범위
+      }
+    }
+  }
+  return -1
+}
+
+/** MIME 타입 매직바이트 판별 */
+function detectImageMime(data: Buffer | Uint8Array): string | null {
+  if (data.length < 4) return null
+  if (data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47) return "image/png"
+  if (data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) return "image/jpeg"
+  if (data[0] === 0x47 && data[1] === 0x49 && data[2] === 0x46) return "image/gif"
+  if (data[0] === 0x42 && data[1] === 0x4d) return "image/bmp"
+  if (data[0] === 0xd7 && data[1] === 0xcd && data[2] === 0xc6 && data[3] === 0x9a) return "image/wmf"
+  if (data[0] === 0x01 && data[1] === 0x00 && data[2] === 0x00 && data[3] === 0x00) return "image/emf"
+  return null
+}
+
+/** OLE2 BinData 스토리지에서 이미지 추출, blocks의 image 블록과 매핑 */
+function extractHwp5Images(
+  cfb: CfbContainer,
+  blocks: IRBlock[],
+  compressed: boolean,
+  warnings: ParseWarning[],
+): ExtractedImage[] {
+  // BinData 스토리지의 모든 파일을 인덱스순으로 나열
+  const binDataMap = new Map<number, { data: Buffer; name: string }>()
+  for (let idx = 0; idx < 10000; idx++) {
+    const entry = CFB.find(cfb, `/BinData/BIN${String(idx).padStart(4, "0")}`)
+      || CFB.find(cfb, `/BinData/Bin${String(idx).padStart(4, "0")}`)
+    if (!entry?.content) {
+      if (idx > 0) break // 연속된 인덱스가 끝나면 중단
+      continue
+    }
+    let data = Buffer.from(entry.content)
+    // compressed 플래그가 있으면 BinData도 압축됨
+    if (compressed) {
+      try { data = decompressStream(data) } catch { /* 이미 비압축일 수 있음 */ }
+    }
+    binDataMap.set(idx, { data, name: entry.name || `BIN${idx}` })
+  }
+
+  if (binDataMap.size === 0) return []
+
+  const images: ExtractedImage[] = []
+  let imageIndex = 0
+
+  for (const block of blocks) {
+    if (block.type !== "image" || !block.text) continue
+    const binId = parseInt(block.text, 10)
+    if (isNaN(binId)) continue
+
+    const bin = binDataMap.get(binId)
+    if (!bin) {
+      warnings.push({ page: block.pageNumber, message: `BinData ${binId} 없음`, code: "SKIPPED_IMAGE" })
+      block.type = "paragraph"
+      block.text = `[이미지: BinData ${binId}]`
+      continue
+    }
+
+    const mime = detectImageMime(bin.data)
+    if (!mime) {
+      warnings.push({ page: block.pageNumber, message: `BinData ${binId}: 알 수 없는 이미지 형식`, code: "SKIPPED_IMAGE" })
+      block.type = "paragraph"
+      block.text = `[이미지: ${bin.name}]`
+      continue
+    }
+
+    imageIndex++
+    const ext = mime.includes("jpeg") ? "jpg" : mime.includes("png") ? "png" : mime.includes("gif") ? "gif" : mime.includes("bmp") ? "bmp" : "bin"
+    const filename = `image_${String(imageIndex).padStart(3, "0")}.${ext}`
+
+    images.push({ filename, data: new Uint8Array(bin.data), mimeType: mime })
+    block.text = filename
+    block.imageData = { data: new Uint8Array(bin.data), mimeType: mime, filename: bin.name }
+  }
+
+  return images
+}
+
 function parseSection(records: HwpRecord[], docInfo: HwpDocInfo | null, warnings: ParseWarning[], sectionNum: number): IRBlock[] {
   const blocks: IRBlock[] = []
   let i = 0
@@ -283,8 +397,15 @@ function parseSection(records: HwpRecord[], docInfo: HwpDocInfo | null, warnings
         i = nextIdx
         continue
       }
-      // 이미지/OLE 제어 — 경고 수집
-      if (ctrlId === "gso " || ctrlId === " osg" || ctrlId === " elo" || ctrlId === "ole ") {
+      // 이미지/OLE 제어 — binDataId 추출 시도
+      if (ctrlId === "gso " || ctrlId === " osg") {
+        const binId = extractBinDataId(records, i)
+        if (binId >= 0) {
+          blocks.push({ type: "image", text: String(binId), pageNumber: sectionNum })
+        } else {
+          warnings.push({ page: sectionNum, message: `스킵된 제어 요소: ${ctrlId.trim()}`, code: "SKIPPED_IMAGE" })
+        }
+      } else if (ctrlId === " elo" || ctrlId === "ole ") {
         warnings.push({ page: sectionNum, message: `스킵된 제어 요소: ${ctrlId.trim()}`, code: "SKIPPED_IMAGE" })
       }
     }

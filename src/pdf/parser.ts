@@ -80,45 +80,57 @@ export async function parsePdfDocument(buffer: ArrayBuffer, options?: ParseOptio
 
     // 페이지 범위 필터링
     const pageFilter = options?.pages ? parsePageRange(options.pages, effectivePageCount) : null
+    const totalTarget = pageFilter ? pageFilter.size : effectivePageCount
 
     // 전체 문서의 폰트 크기 통계 수집 (헤딩 감지용)
     const allFontSizes: number[] = []
+    const pageHeights = new Map<number, number>()
 
+    let parsedPages = 0
     for (let i = 1; i <= effectivePageCount; i++) {
       if (pageFilter && !pageFilter.has(i)) continue
-      const page = await doc.getPage(i)
-      const tc = await page.getTextContent()
-      const viewport = page.getViewport({ scale: 1 })
-      const rawItems = tc.items as PdfTextItem[]
-      const items = normalizeItems(rawItems)
+      try {
+        const page = await doc.getPage(i)
+        const tc = await page.getTextContent()
+        const viewport = page.getViewport({ scale: 1 })
+        pageHeights.set(i, viewport.height)
+        const rawItems = tc.items as PdfTextItem[]
+        const items = normalizeItems(rawItems)
 
-      // hidden text 필터링 + 경고 수집
-      const { visible, hiddenCount } = filterHiddenText(items, viewport.width, viewport.height)
-      if (hiddenCount > 0) {
-        warnings.push({ page: i, message: `${hiddenCount}개 숨겨진 텍스트 요소 필터링됨`, code: "HIDDEN_TEXT_FILTERED" })
+        // hidden text 필터링 + 경고 수집
+        const { visible, hiddenCount } = filterHiddenText(items, viewport.width, viewport.height)
+        if (hiddenCount > 0) {
+          warnings.push({ page: i, message: `${hiddenCount}개 숨겨진 텍스트 요소 필터링됨`, code: "HIDDEN_TEXT_FILTERED" })
+        }
+
+        // 폰트 크기 통계 수집
+        for (const item of visible) {
+          if (item.fontSize > 0) allFontSizes.push(item.fontSize)
+        }
+
+        // 선 기반 테이블 감지를 위한 operatorList
+        const opList = await page.getOperatorList()
+
+        const pageBlocks = extractPageBlocksWithLines(visible, i, opList, viewport.width, viewport.height)
+        for (const b of pageBlocks) blocks.push(b)
+
+        // 이미지 기반 PDF 감지 + 크기 제한용 문자 수 집계
+        for (const b of pageBlocks) {
+          const t = b.text || ""
+          totalChars += t.replace(/\s/g, "").length
+          totalTextBytes += t.length * 2
+        }
+        if (totalTextBytes > MAX_TOTAL_TEXT) throw new KordocError("텍스트 추출 크기 초과")
+        parsedPages++
+        options?.onProgress?.(parsedPages, totalTarget)
+      } catch (pageErr) {
+        // 크기 초과는 전체 중단
+        if (pageErr instanceof KordocError) throw pageErr
+        warnings.push({ page: i, message: `페이지 ${i} 파싱 실패: ${pageErr instanceof Error ? pageErr.message : "알 수 없는 오류"}`, code: "PARTIAL_PARSE" })
       }
-
-      // 폰트 크기 통계 수집
-      for (const item of visible) {
-        if (item.fontSize > 0) allFontSizes.push(item.fontSize)
-      }
-
-      // 선 기반 테이블 감지를 위한 operatorList
-      const opList = await page.getOperatorList()
-
-      const pageBlocks = extractPageBlocksWithLines(visible, i, opList, viewport.width, viewport.height)
-      for (const b of pageBlocks) blocks.push(b)
-
-      // 이미지 기반 PDF 감지 + 크기 제한용 문자 수 집계
-      for (const b of pageBlocks) {
-        const t = b.text || ""
-        totalChars += t.replace(/\s/g, "").length
-        totalTextBytes += t.length * 2
-      }
-      if (totalTextBytes > MAX_TOTAL_TEXT) throw new KordocError("텍스트 추출 크기 초과")
     }
 
-    const parsedPageCount = pageFilter ? pageFilter.size : effectivePageCount
+    const parsedPageCount = parsedPages || (pageFilter ? pageFilter.size : effectivePageCount)
     if (totalChars / Math.max(parsedPageCount, 1) < 10) {
       if (options?.ocr) {
         try {
@@ -133,6 +145,15 @@ export async function parsePdfDocument(buffer: ArrayBuffer, options?: ParseOptio
         }
       }
       return { success: false, fileType: "pdf", pageCount, isImageBased: true, error: `이미지 기반 PDF (${pageCount}페이지, ${totalChars}자)`, code: "IMAGE_BASED_PDF" }
+    }
+
+    // 머리글/바닥글 필터링
+    if (options?.removeHeaderFooter && parsedPageCount >= 3) {
+      const removed = removeHeaderFooterBlocks(blocks, pageHeights, warnings)
+      // 필터링된 블록 제거 (뒤에서부터 삭제)
+      for (let ri = removed.length - 1; ri >= 0; ri--) {
+        blocks.splice(removed[ri], 1)
+      }
     }
 
     // 헤딩 감지: 폰트 크기 기반
@@ -1127,6 +1148,87 @@ function detectSpecialKoreanTables(blocks: IRBlock[]): IRBlock[] {
 
   flushKvTable()
   return result
+}
+
+// ─── 머리글/바닥글 감지 ────────────────────────────
+
+/** 상단/하단 10% 영역에서 페이지간 반복 텍스트를 감지하여 제거 대상 인덱스 반환 */
+function removeHeaderFooterBlocks(
+  blocks: IRBlock[],
+  pageHeights: Map<number, number>,
+  warnings: ParseWarning[],
+): number[] {
+  const ZONE_RATIO = 0.1 // 상하 10%
+  const MIN_REPEAT = 3   // 최소 3페이지에서 반복
+
+  // 페이지별 상단/하단 텍스트 수집
+  const headerTexts = new Map<number, string[]>() // page → texts
+  const footerTexts = new Map<number, string[]>()
+
+  for (let bi = 0; bi < blocks.length; bi++) {
+    const b = blocks[bi]
+    if (!b.bbox || !b.pageNumber || !b.text?.trim()) continue
+    const ph = pageHeights.get(b.bbox.page) || pageHeights.get(b.pageNumber)
+    if (!ph) continue
+
+    const blockTop = ph - (b.bbox.y + b.bbox.height) // PDF Y좌표는 아래가 0
+    const blockBottom = ph - b.bbox.y
+
+    if (blockBottom <= ph * ZONE_RATIO) {
+      // 하단 영역
+      const arr = footerTexts.get(b.pageNumber) || []
+      arr.push(b.text.trim())
+      footerTexts.set(b.pageNumber, arr)
+    } else if (blockTop >= ph * (1 - ZONE_RATIO)) {
+      // 상단 영역
+      const arr = headerTexts.get(b.pageNumber) || []
+      arr.push(b.text.trim())
+      headerTexts.set(b.pageNumber, arr)
+    }
+  }
+
+  // 반복 패턴 찾기: 페이지 번호 변동 허용 (숫자만 다른 경우)
+  const repeatedPatterns = new Set<string>()
+  for (const textsMap of [headerTexts, footerTexts]) {
+    const patternCount = new Map<string, number>()
+    for (const [, texts] of textsMap) {
+      for (const t of texts) {
+        // 숫자를 와일드카드로 치환하여 "- 1 -", "- 2 -" 같은 패턴 통합
+        const normalized = t.replace(/\d+/g, "#")
+        patternCount.set(normalized, (patternCount.get(normalized) || 0) + 1)
+      }
+    }
+    for (const [pattern, count] of patternCount) {
+      if (count >= MIN_REPEAT) repeatedPatterns.add(pattern)
+    }
+  }
+
+  if (repeatedPatterns.size === 0) return []
+
+  // 반복 패턴에 매칭되는 블록 인덱스 수집
+  const removeIndices: number[] = []
+  for (let bi = 0; bi < blocks.length; bi++) {
+    const b = blocks[bi]
+    if (!b.bbox || !b.pageNumber || !b.text?.trim()) continue
+    const ph = pageHeights.get(b.bbox.page) || pageHeights.get(b.pageNumber)
+    if (!ph) continue
+
+    const blockTop = ph - (b.bbox.y + b.bbox.height)
+    const blockBottom = ph - b.bbox.y
+    const inZone = blockBottom <= ph * ZONE_RATIO || blockTop >= ph * (1 - ZONE_RATIO)
+    if (!inZone) continue
+
+    const normalized = b.text.trim().replace(/\d+/g, "#")
+    if (repeatedPatterns.has(normalized)) {
+      removeIndices.push(bi)
+    }
+  }
+
+  if (removeIndices.length > 0) {
+    warnings.push({ message: `${removeIndices.length}개 머리글/바닥글 요소 제거됨`, code: "HIDDEN_TEXT_FILTERED" })
+  }
+
+  return removeIndices
 }
 
 function mergeKoreanLines(text: string): string {

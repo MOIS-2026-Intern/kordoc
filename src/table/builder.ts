@@ -102,6 +102,12 @@ export function blocksToMarkdown(blocks: IRBlock[]): string {
       continue
     }
 
+    // 이미지 블록 — ![alt](filename) 참조
+    if (block.type === "image" && block.text) {
+      lines.push("", `![image](${block.text})`, "")
+      continue
+    }
+
     // 구분선 블록
     if (block.type === "separator") {
       lines.push("", "---", "")

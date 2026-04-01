@@ -8,7 +8,7 @@ import JSZip from "jszip"
 import { inflateRawSync } from "zlib"
 import { DOMParser } from "@xmldom/xmldom"
 import { buildTable, convertTableToText, blocksToMarkdown, MAX_COLS, MAX_ROWS } from "../table/builder.js"
-import type { CellContext, IRBlock, DocumentMetadata, InternalParseResult, ParseOptions, ParseWarning, OutlineItem, InlineStyle } from "../types.js"
+import type { CellContext, IRBlock, DocumentMetadata, InternalParseResult, ParseOptions, ParseWarning, OutlineItem, InlineStyle, ExtractedImage } from "../types.js"
 import { KordocError, isPathTraversal } from "../utils.js"
 import { parsePageRange } from "../page-range.js"
 
@@ -186,16 +186,28 @@ export async function parseHwpxDocument(buffer: ArrayBuffer, options?: ParseOpti
 
   // 페이지 범위 필터링 (섹션 단위 근사치)
   const pageFilter = options?.pages ? parsePageRange(options.pages, sectionPaths.length) : null
+  const totalTarget = pageFilter ? pageFilter.size : sectionPaths.length
   const blocks: IRBlock[] = []
+  let parsedSections = 0
   for (let si = 0; si < sectionPaths.length; si++) {
     if (pageFilter && !pageFilter.has(si + 1)) continue
     const file = zip.file(sectionPaths[si])
     if (!file) continue
-    const xml = await file.async("text")
-    decompressed.total += xml.length * 2
-    if (decompressed.total > MAX_DECOMPRESS_SIZE) throw new KordocError("ZIP 압축 해제 크기 초과 (ZIP bomb 의심)")
-    blocks.push(...parseSectionXml(xml, styleMap, warnings, si + 1))
+    try {
+      const xml = await file.async("text")
+      decompressed.total += xml.length * 2
+      if (decompressed.total > MAX_DECOMPRESS_SIZE) throw new KordocError("ZIP 압축 해제 크기 초과 (ZIP bomb 의심)")
+      blocks.push(...parseSectionXml(xml, styleMap, warnings, si + 1))
+      parsedSections++
+      options?.onProgress?.(parsedSections, totalTarget)
+    } catch (secErr) {
+      if (secErr instanceof KordocError) throw secErr
+      warnings.push({ page: si + 1, message: `섹션 ${si + 1} 파싱 실패: ${secErr instanceof Error ? secErr.message : "알 수 없는 오류"}`, code: "PARTIAL_PARSE" })
+    }
   }
+
+  // 이미지 블록에서 ZIP 바이너리 추출
+  const images = await extractImagesFromZip(zip, blocks, decompressed, warnings)
 
   // 스타일 기반 헤딩 감지
   detectHwpxHeadings(blocks, styleMap)
@@ -206,7 +218,97 @@ export async function parseHwpxDocument(buffer: ArrayBuffer, options?: ParseOpti
     .map(b => ({ level: b.level!, text: b.text!, pageNumber: b.pageNumber }))
 
   const markdown = blocksToMarkdown(blocks)
-  return { markdown, blocks, metadata, outline: outline.length > 0 ? outline : undefined, warnings: warnings.length > 0 ? warnings : undefined }
+  return { markdown, blocks, metadata, outline: outline.length > 0 ? outline : undefined, warnings: warnings.length > 0 ? warnings : undefined, images: images.length > 0 ? images : undefined }
+}
+
+// ─── 이미지 추출 ───────────────────────────────────
+
+/** 확장자 → MIME 타입 */
+function imageExtToMime(ext: string): string {
+  switch (ext.toLowerCase()) {
+    case "jpg": case "jpeg": return "image/jpeg"
+    case "png": return "image/png"
+    case "gif": return "image/gif"
+    case "bmp": return "image/bmp"
+    case "tif": case "tiff": return "image/tiff"
+    case "wmf": return "image/wmf"
+    case "emf": return "image/emf"
+    case "svg": return "image/svg+xml"
+    default: return "application/octet-stream"
+  }
+}
+
+/** MIME → 확장자 */
+function mimeToExt(mime: string): string {
+  if (mime.includes("jpeg")) return "jpg"
+  if (mime.includes("png")) return "png"
+  if (mime.includes("gif")) return "gif"
+  if (mime.includes("bmp")) return "bmp"
+  if (mime.includes("tiff")) return "tif"
+  if (mime.includes("wmf")) return "wmf"
+  if (mime.includes("emf")) return "emf"
+  if (mime.includes("svg")) return "svg"
+  return "bin"
+}
+
+/** blocks에서 type="image" 블록의 참조를 ZIP에서 실제 바이너리로 변환 */
+async function extractImagesFromZip(
+  zip: JSZip,
+  blocks: IRBlock[],
+  decompressed: { total: number },
+  warnings?: ParseWarning[],
+): Promise<ExtractedImage[]> {
+  const images: ExtractedImage[] = []
+  let imageIndex = 0
+
+  for (const block of blocks) {
+    if (block.type !== "image" || !block.text) continue
+
+    const ref = block.text
+    // BinData/ 폴더 내에서 참조 파일 찾기
+    const candidates = [
+      `BinData/${ref}`,
+      `Contents/BinData/${ref}`,
+      ref, // 절대 경로일 수도 있음
+    ]
+
+    let found = false
+    for (const path of candidates) {
+      if (isPathTraversal(path)) continue
+      const file = zip.file(path)
+      if (!file) continue
+
+      try {
+        const data = await file.async("uint8array")
+        decompressed.total += data.length
+        if (decompressed.total > MAX_DECOMPRESS_SIZE) throw new KordocError("ZIP 압축 해제 크기 초과 (ZIP bomb 의심)")
+
+        const ext = ref.includes(".") ? ref.split(".").pop()! : "png"
+        const mimeType = imageExtToMime(ext)
+        imageIndex++
+        const filename = `image_${String(imageIndex).padStart(3, "0")}.${mimeToExt(mimeType)}`
+
+        images.push({ filename, data, mimeType })
+        // 블록 텍스트를 참조 파일명으로 교체
+        block.text = filename
+        block.imageData = { data, mimeType, filename: ref }
+        found = true
+        break
+      } catch (err) {
+        if (err instanceof KordocError) throw err
+        // 개별 이미지 실패는 경고로 처리
+      }
+    }
+
+    if (!found) {
+      warnings?.push({ page: block.pageNumber, message: `이미지 파일 없음: ${ref}`, code: "SKIPPED_IMAGE" })
+      // image 블록을 paragraph로 전환 (참조만 남김)
+      block.type = "paragraph"
+      block.text = `[이미지: ${ref}]`
+    }
+  }
+
+  return images
 }
 
 // ─── 메타데이터 추출 (best-effort) ───────────────────
@@ -511,6 +613,30 @@ function parseSectionXml(xml: string, styleMap?: HwpxStyleMap, warnings?: ParseW
   return blocks
 }
 
+/** pic/shape 요소에서 이미지 참조 경로 추출 (binaryItemIDRef 또는 href) */
+function extractImageRef(el: Element): string | null {
+  // HWPX: <hp:imgRect> 또는 <hp:img> 내 binaryItemIDRef 속성
+  // 또는 하위에서 img 관련 속성 탐색
+  const children = el.childNodes
+  if (!children) return null
+  for (let i = 0; i < children.length; i++) {
+    const child = children[i] as Element
+    if (child.nodeType !== 1) continue
+    const tag = (child.tagName || child.localName || "").replace(/^[^:]+:/, "")
+    if (tag === "imgRect" || tag === "img" || tag === "imgClip") {
+      const ref = child.getAttribute("binaryItemIDRef") || child.getAttribute("href") || ""
+      if (ref) return ref
+    }
+    // lineShape > imgRect 같은 중첩 구조
+    const nested = extractImageRef(child)
+    if (nested) return nested
+  }
+  // 직접 속성 체크
+  const directRef = el.getAttribute("binaryItemIDRef") || ""
+  if (directRef) return directRef
+  return null
+}
+
 function walkSection(
   node: Node, blocks: IRBlock[],
   tableCtx: TableState | null, tableStack: TableState[],
@@ -600,12 +726,16 @@ function walkSection(
         break
       }
 
-      // 이미지/그림 — 경고 수집
-      case "pic": case "shape": case "drawingObject":
-        if (warnings && sectionNum) {
+      // 이미지/그림 — 경로 추출 또는 경고
+      case "pic": case "shape": case "drawingObject": {
+        const imgRef = extractImageRef(el)
+        if (imgRef) {
+          blocks.push({ type: "image", text: imgRef, pageNumber: sectionNum })
+        } else if (warnings && sectionNum) {
           warnings.push({ page: sectionNum, message: `스킵된 요소: ${localTag}`, code: "SKIPPED_IMAGE" })
         }
         break
+      }
 
       default:
         walkSection(el, blocks, tableCtx, tableStack, styleMap, warnings, sectionNum, depth + 1)
@@ -650,7 +780,10 @@ function walkParagraphChildren(
         tableCtx = tableStack.length > 0 ? tableStack.pop()! : null
       }
     } else if (localTag === "pic" || localTag === "shape" || localTag === "drawingObject") {
-      if (warnings && sectionNum) {
+      const imgRef = extractImageRef(el)
+      if (imgRef) {
+        blocks.push({ type: "image", text: imgRef, pageNumber: sectionNum })
+      } else if (warnings && sectionNum) {
         warnings.push({ page: sectionNum, message: `스킵된 요소: ${localTag}`, code: "SKIPPED_IMAGE" })
       }
     }
