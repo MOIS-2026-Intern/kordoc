@@ -48,20 +48,24 @@ function decryptDistributePayload(payload: Uint8Array): Uint8Array {
   const seed = (payload[0] | (payload[1] << 8) | (payload[2] << 16) | (payload[3] << 24)) >>> 0
   const lcg = new MsvcLcg(seed)
 
-  const result = new Uint8Array(256)
-  result[0] = payload[0]
-  result[1] = payload[1]
-  result[2] = payload[2]
-  result[3] = payload[3]
+  const result = new Uint8Array(payload.subarray(0, 256))  // 원본 복사
 
-  let i = 4
+  // rhwp 호환: i=0부터 시작하여 n 카운터를 소비하되, i<4는 XOR 스킵 (seed 보존)
+  // i=4부터 시작하면 LCG 시퀀스가 어긋남 — i=0~3에서도 n을 소비해야 정확함
+  let i = 0
+  let n = 0
+  let key = 0
+
   while (i < 256) {
-    const keyByte = lcg.rand() & 0xff
-    const n = (lcg.rand() & 0x0f) + 1  // 1~16 바이트에 같은 키 적용
-
-    for (let j = 0; j < n && i < 256; j++, i++) {
-      result[i] = payload[i] ^ keyByte
+    if (n === 0) {
+      key = lcg.rand() & 0xff
+      n = (lcg.rand() & 0x0f) + 1
     }
+    if (i >= 4) {
+      result[i] ^= key
+    }
+    i++
+    n--
   }
 
   return result
@@ -103,8 +107,8 @@ function parseRecordHeader(data: Uint8Array, offset: number): { tagId: number; s
 
 // ── 공개 API ──
 
-/** HWPTAG_DISTRIBUTE_DOC_DATA 태그 ID (HWPTAG_BEGIN + 28 = 0x10 + 28 = 0x2C = 44) */
-const TAG_DISTRIBUTE_DOC_DATA = 0x10 + 28  // = 44
+/** HWPTAG_DISTRIBUTE_DOC_DATA 태그 ID (HWPTAG_BEGIN + 12 = 0x10 + 12 = 0x1C = 28) */
+const TAG_DISTRIBUTE_DOC_DATA = 0x10 + 12  // = 28
 
 /**
  * ViewText 스트림을 복호화하여 일반 BodyText 레코드 데이터로 변환.

@@ -157,8 +157,8 @@ describe("decryptViewText", () => {
   })
 
   it("payload 크기 부족이면 에러", () => {
-    // TAG_DISTRIBUTE_DOC_DATA = 44, size = 100 (< 256)
-    const tagId = 44
+    // TAG_DISTRIBUTE_DOC_DATA = 28 (HWPTAG_BEGIN + 12), size = 100 (< 256)
+    const tagId = 28
     const header = (tagId & 0x3ff) | (0 << 10) | (100 << 20)
     const buf = Buffer.alloc(4 + 100)
     buf.writeUInt32LE(header, 0)
