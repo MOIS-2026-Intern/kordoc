@@ -1,14 +1,7 @@
 /** 2-pass colSpan/rowSpan 테이블 빌더 및 Markdown 변환 */
 
 import type { CellContext, IRBlock, IRCell, IRTable } from "../types.js"
-
-/** 하이퍼링크 URL 살균 — javascript: 등 XSS 위험 스킴 차단 */
-const SAFE_HREF_RE = /^(?:https?:|mailto:|tel:|#)/i
-function sanitizeHref(href: string): string | null {
-  const trimmed = href.trim()
-  if (!trimmed || !SAFE_HREF_RE.test(trimmed)) return null
-  return trimmed
-}
+import { sanitizeHref } from "../utils.js"
 
 /** 테이블 열 수 상한 — 한국 공공문서 기준 충분한 값 */
 export const MAX_COLS = 200

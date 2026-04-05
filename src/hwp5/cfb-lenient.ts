@@ -15,7 +15,6 @@ import { decompressStream } from "./record.js"
 const CFB_MAGIC = Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1])
 const END_OF_CHAIN = 0xfffffffe
 const FREE_SECT = 0xffffffff
-const DIFAT_SECT = 0xfffffffc
 
 /** 순환 감지용 최대 체인 길이 */
 const MAX_CHAIN_LENGTH = 1_000_000
@@ -51,8 +50,10 @@ export function parseLenientCfb(data: Buffer): LenientCfbContainer {
   // ── 헤더 파싱 ──
 
   const sectorSizeShift = data.readUInt16LE(30)
+  if (sectorSizeShift < 7 || sectorSizeShift > 16) throw new Error("유효하지 않은 섹터 크기 시프트: " + sectorSizeShift)
   const sectorSize = 1 << sectorSizeShift  // 보통 512
   const miniSectorSizeShift = data.readUInt16LE(32)
+  if (miniSectorSizeShift > 16) throw new Error("유효하지 않은 미니 섹터 크기 시프트: " + miniSectorSizeShift)
   const miniSectorSize = 1 << miniSectorSizeShift  // 보통 64
 
   const fatSectorCount = data.readUInt32LE(44)

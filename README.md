@@ -2,7 +2,7 @@
 
 **모두 파싱해버리겠다.**
 
-[![npm version](https://img.shields.io/badge/npm-v1.8.0-cb3837.svg)](https://www.npmjs.com/package/kordoc)
+[![npm version](https://img.shields.io/badge/npm-v2.0.0-cb3837.svg)](https://www.npmjs.com/package/kordoc)
 [![license](https://img.shields.io/npm/l/kordoc.svg)](https://github.com/chrisryugj/kordoc/blob/main/LICENSE)
 
 > *대한민국에서 둘째가라면 서러울 문서지옥. 거기서 7년 버틴 공무원이 만들었습니다.*
@@ -27,12 +27,23 @@ HWP, HWPX, PDF, XLSX, DOCX — 관공서에서 쏟아지는 모든 문서를 파
 
 ---
 
-## v1.8.0 변경사항
+## v2.0.0 변경사항
+
+- **HWP5 배포용 문서 복호화** — 열람 제한 HWP 파일을 AES-128 ECB로 복호화. 순수 JS 구현, 네이티브 의존성 없음. [rhwp](https://github.com/pjc0247/rhwp)(MIT) 알고리즘 포팅.
+- **손상된 HWP 파일 복구** — 표준 CFB 모듈이 거부하는 파일을 직접 FAT/디렉토리 파싱으로 복구. rhwp의 LenientCfbReader 포팅.
+- **HWP5 각주/미주/하이퍼링크 추출** — 각주 본문 텍스트 연결, 하이퍼링크 URL 추출 및 XSS 살균.
+- **HWPX 표 병합 밀림 수정** — colspan/rowspan 그리드 계산 버그 수정.
+- **보안 강화** — CFB 섹터 크기 검증, sanitizeHref 3중 경로 일관 적용.
+
+<details>
+<summary>v1.8.0 변경사항</summary>
 
 - **XLSX 파서 추가** — Excel 스프레드시트 파싱. 공유 문자열, 병합 셀, 다중 시트 지원. 시트별 heading + table 블록 생성.
 - **DOCX 파서 추가** — Word 문서 파싱. 스타일 기반 heading, 번호 매기기(리스트), 각주, 하이퍼링크, 이미지 추출, vMerge/gridSpan 테이블 병합.
 - **파싱 품질 대폭 개선** — PDF/HWPX/HWP5/XLSX 전 포맷 품질 점수 73→93점.
 - **프로덕션 리뷰 17건 수정** — CLI `--no-header-footer` 플래그 반전 버그, MCP XLSX/DOCX 확장자 허용, ZIP bomb 보호 공유 유틸화, href XSS 살균 강화, PDF timeout 타이머 정리, HWP5 BinData O(n) 최적화, cluster indexOf O(n²)→O(n), SSRF IPv6 차단 등.
+
+</details>
 
 <details>
 <summary>v1.7.x 변경사항</summary>
@@ -252,7 +263,7 @@ import type {
 | 포맷 | 엔진 | 특징 |
 |------|------|------|
 | **HWPX** (한컴 2020+) | ZIP + XML DOM | 매니페스트, 중첩 테이블, 병합 셀, 손상 ZIP 복구 |
-| **HWP 5.x** (한컴 레거시) | OLE2 + CFB | 21종 제어문자, zlib 압축 해제, DRM 감지, colAddr 기반 셀 배치 |
+| **HWP 5.x** (한컴 레거시) | OLE2 + CFB | 배포용 복호화, 손상 CFB 복구, 각주/하이퍼링크, 21종 제어문자, 이미지 추출 |
 | **PDF** | pdfjs-dist | 선 기반 테이블, XY-Cut 읽기 순서, 헤딩 감지, OCR |
 | **XLSX** (Excel) | ZIP + XML DOM | 공유 문자열, 병합 셀, 다중 시트, 수식 표시 |
 | **DOCX** (Word) | ZIP + XML DOM | 스타일 heading, 번호 매기기, 각주, 이미지 추출 |
@@ -271,6 +282,7 @@ import type {
 [MIT](./LICENSE)
 
 이 프로젝트는 아래 오픈소스를 포함합니다:
+- **rhwp** (MIT, pjc0247) — HWP5 배포용 복호화 및 lenient CFB 파싱 알고리즘
 - **OpenDataLoader PDF** (Apache 2.0, Hancom Inc.) — PDF 테이블 감지 알고리즘
 - **cfb** (Apache 2.0, SheetJS) — HWP5 OLE2 컨테이너 파싱
 - **pdfjs-dist** (Apache 2.0, Mozilla) — PDF 텍스트 추출

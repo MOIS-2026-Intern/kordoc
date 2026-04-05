@@ -11,7 +11,7 @@ import { parseLenientCfb, type LenientCfbContainer } from "./cfb-lenient.js"
 import { buildTable, blocksToMarkdown, MAX_COLS, MAX_ROWS } from "../table/builder.js"
 import type { CellContext, IRBlock, IRTable, DocumentMetadata, InternalParseResult, ParseOptions, ParseWarning, OutlineItem, InlineStyle, ExtractedImage } from "../types.js"
 import { HEADING_RATIO_H1, HEADING_RATIO_H2, HEADING_RATIO_H3 } from "../types.js"
-import { KordocError } from "../utils.js"
+import { KordocError, sanitizeHref } from "../utils.js"
 import { parsePageRange } from "../page-range.js"
 
 import { createRequire } from "module"
@@ -573,7 +573,7 @@ function parseSection(records: HwpRecord[], docInfo: HwpDocInfo | null, warnings
         if (url && blocks.length > 0) {
           const lastBlock = blocks[blocks.length - 1]
           if (lastBlock.type === "paragraph" && !lastBlock.href) {
-            lastBlock.href = url
+            lastBlock.href = sanitizeHref(url) ?? undefined
           }
         }
       }

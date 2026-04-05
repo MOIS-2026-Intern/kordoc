@@ -146,6 +146,7 @@ export type WarningCode =
   | "HIDDEN_TEXT_FILTERED"
   | "MALFORMED_XML"
   | "PARTIAL_PARSE"
+  | "LENIENT_CFB_RECOVERY"
 
 /** 문서 구조 (헤딩 트리) */
 export interface OutlineItem {

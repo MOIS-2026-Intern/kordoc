@@ -22,11 +22,11 @@ export const TAG_DOC_STYLE = 0x003a
 
 // 특수 문자 코드 (UTF-16LE) — HWP 5.0 바이너리 스펙 + rhwp 검증
 // 3가지 카테고리: char(2바이트), inline(16바이트), extended(16바이트)
-// char:     0, 10, 13, 24-31 — 제어문자만, 확장 데이터 없음
-// inline:   4-9, 19-20       — 제어문자(2) + 확장(14) = 16바이트
-// extended: 1-3, 11-12, 14-18, 21-23 — 제어문자(2) + 확장(14) = 16바이트
+// char:     0, 13, 24-31           — 제어문자만, 확장 데이터 없음
+// inline:   4-9, 19-20             — 제어문자(2) + 확장(14) = 16바이트
+// extended: 1-3, 10-12, 14-18, 21-23 — 제어문자(2) + 확장(14) = 16바이트
 const CHAR_LINE = 0x0000        // char: 줄바꿈
-const CHAR_SECTION_BREAK = 0x000a  // char: 구역/단 나눔
+const CHAR_SECTION_BREAK = 0x000a  // extended: 구역/단 정의 (14바이트 확장 데이터)
 const CHAR_PARA = 0x000d        // char: 문단 끝
 const CHAR_TAB = 0x0009         // inline: 탭
 const CHAR_HYPHEN = 0x001e      // char: 하이픈
@@ -222,7 +222,10 @@ export function extractText(data: Buffer): string {
     switch (ch) {
       // ── char 타입 (2바이트만, 확장 데이터 없음) ──
       case CHAR_LINE: result += "\n"; break
-      case CHAR_SECTION_BREAK: result += "\n"; break  // 구역/단 나눔 → 줄바꿈
+      case CHAR_SECTION_BREAK:  // 구역/단 정의 — extended(14바이트 스킵)
+        result += "\n"
+        if (i + 14 <= data.length) i += 14
+        break
       case CHAR_PARA: break  // 문단 끝
       case CHAR_HYPHEN: result += "-"; break
       case CHAR_NBSP: result += " "; break

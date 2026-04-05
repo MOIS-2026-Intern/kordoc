@@ -2,7 +2,7 @@
 
 **모두 파싱해버리겠다** — The Korean Document Platform.
 
-[![npm version](https://img.shields.io/badge/npm-v1.8.0-cb3837.svg)](https://www.npmjs.com/package/kordoc)
+[![npm version](https://img.shields.io/badge/npm-v2.0.0-cb3837.svg)](https://www.npmjs.com/package/kordoc)
 [![license](https://img.shields.io/npm/l/kordoc.svg)](https://github.com/chrisryugj/kordoc/blob/main/LICENSE)
 [![node](https://img.shields.io/node/v/kordoc.svg)](https://nodejs.org)
 
@@ -26,12 +26,23 @@ Beyond simple text extraction, kordoc automates the **entire lifecycle of Korean
 
 ---
 
-## What's New in v1.8.0
+## What's New in v2.0.0
+
+- **HWP5 Distribution Document Decryption** — Decrypt view-restricted HWP files with AES-128 ECB. Pure JS implementation, no native dependencies. Algorithm ported from [rhwp](https://github.com/pjc0247/rhwp) (MIT).
+- **Corrupted HWP File Recovery** — Recover files rejected by standard CFB modules via direct FAT/directory parsing. Ported from rhwp's LenientCfbReader.
+- **HWP5 Footnote/Endnote/Hyperlink Extraction** — Footnote text linking, hyperlink URL extraction with XSS sanitization.
+- **HWPX Table Merge Fix** — Fixed colspan/rowspan grid calculation bug causing cell misalignment.
+- **Security Hardening** — CFB sector size validation, consistent sanitizeHref across all 3 code paths.
+
+<details>
+<summary>v1.8.0 changes</summary>
 
 - **XLSX Parser** — Excel spreadsheet parsing. Shared strings, merged cells, multi-sheet support. Each sheet becomes heading + table blocks.
 - **DOCX Parser** — Word document parsing. Style-based headings, numbering (lists), footnotes, hyperlinks, image extraction, vMerge/gridSpan table merging.
 - **Major Quality Improvement** — Parsing quality score improved 73→93 across all formats (PDF/HWPX/HWP5/XLSX).
 - **Production Review: 17 Fixes** — CLI `--no-header-footer` flag inversion, MCP XLSX/DOCX extension support, shared ZIP bomb protection, href XSS sanitization at extraction time, PDF timeout cleanup, HWP5 BinData O(n) optimization, cluster indexOf O(n²)→O(n), SSRF IPv6 blocking, and more.
+
+</details>
 
 <details>
 <summary>v1.7.x changes</summary>
@@ -260,7 +271,7 @@ import type {
 | Format | Engine | Features |
 |--------|--------|----------|
 | **HWPX** (한컴 2020+) | ZIP + XML DOM | Manifest, nested tables, merged cells, broken ZIP recovery |
-| **HWP 5.x** (한컴 Legacy) | OLE2 + CFB | 21 control chars, zlib decompression, DRM detection, colAddr-based table cell placement |
+| **HWP 5.x** (한컴 Legacy) | OLE2 + CFB | Distribution decryption, corrupted CFB recovery, footnotes/hyperlinks, 21 control chars, image extraction |
 | **PDF** | pdfjs-dist | Line-based table detection, XY-Cut reading order, heading detection, hidden text filter, OCR |
 | **XLSX** (Excel) | ZIP + XML DOM | Shared strings, merged cells, multi-sheet, formula display |
 | **DOCX** (Word) | ZIP + XML DOM | Style headings, numbering, footnotes, image extraction |
@@ -278,6 +289,7 @@ Production-tested across 5 Korean government projects: school curriculum plans, 
 [MIT](./LICENSE)
 
 This project includes the following open-source components:
+- **rhwp** (MIT, pjc0247) — HWP5 distribution decryption and lenient CFB parsing algorithms
 - **OpenDataLoader PDF** (Apache 2.0, Hancom Inc.) — PDF table detection algorithms
 - **cfb** (Apache 2.0, SheetJS) — HWP5 OLE2 container parsing
 - **pdfjs-dist** (Apache 2.0, Mozilla) — PDF text extraction

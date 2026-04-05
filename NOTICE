@@ -59,3 +59,22 @@ This project uses JSZip under the MIT License.
 
 Used for ZIP-based format parsing (HWPX, XLSX, DOCX).
 No modifications — used as an npm package.
+
+================================================================================
+
+rhwp
+https://github.com/pjc0247/rhwp
+
+Copyright pjc0247
+Licensed under the MIT License
+
+Used in:
+- src/hwp5/cfb-lenient.ts — LenientCfbReader algorithm (FAT/directory/mini-stream
+  parsing for corrupted CFB containers)
+- src/hwp5/crypto.ts — Distribution document decryption algorithm (AES key
+  extraction from MSVC LCG-scrambled payload)
+
+Modifications:
+- TypeScript rewrite from Rust
+- Added sector size validation, chain length limits, and cycle detection
+- Pure JS AES-128 ECB implementation (no native dependency)
