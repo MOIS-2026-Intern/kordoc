@@ -166,6 +166,8 @@ export async function parsePdfDocument(buffer: ArrayBuffer, options?: ParseOptio
     const medianFontSize = computeMedianFontSize(allFontSizes)
     if (medianFontSize > 0) {
       detectHeadings(blocks, medianFontSize)
+      // 같은 Y좌표의 연속 헤딩 블록 병합 ("1.3" + "사업비의 산정" → "1.3 사업비의 산정")
+      mergeAdjacentHeadings(blocks)
     }
 
     // □/■ 마커 기반 서브헤딩 감지 (ODL 패턴)
@@ -292,6 +294,53 @@ function detectHeadings(blocks: IRBlock[], medianFontSize: number): void {
   }
 }
 
+/**
+ * 같은 Y좌표(같은 시각적 행)의 연속 헤딩 블록을 하나로 병합.
+ * 예: "1.3" (H1) + "사업비의 산정" (H1) → "1.3 사업비의 산정" (H1)
+ */
+function mergeAdjacentHeadings(blocks: IRBlock[]): void {
+  let i = 0
+  while (i < blocks.length - 1) {
+    const curr = blocks[i]
+    const next = blocks[i + 1]
+    if (curr.type !== "heading" || next.type !== "heading") { i++; continue }
+    if (!curr.bbox || !next.bbox || !curr.text || !next.text) { i++; continue }
+
+    // 같은 페이지 + 같은 헤딩 레벨
+    // Y비교: bbox가 배경 사각형으로 부풀려질 수 있으므로, fontSize 기반 baseline 추정
+    // baseline ≈ bbox.y + fontSize (PDF 좌표계에서 y는 baseline, bbox.y는 하단)
+    const currBaseline = curr.bbox.y + (curr.style?.fontSize || curr.bbox.height)
+    const nextBaseline = next.bbox.y + (next.style?.fontSize || next.bbox.height)
+    const yDiff = Math.abs(currBaseline - nextBaseline)
+    const maxFs = Math.max(curr.style?.fontSize || 12, next.style?.fontSize || 12)
+    const sameY = curr.bbox.page === next.bbox.page && yDiff < maxFs * 1.5
+    const sameLevel = curr.level === next.level
+
+    if (sameY && sameLevel) {
+      // X좌표 기준으로 왼쪽→오른쪽 순서로 합침
+      const currX = curr.bbox.x
+      const nextX = next.bbox.x
+      if (currX <= nextX) {
+        curr.text = curr.text + " " + next.text
+      } else {
+        curr.text = next.text + " " + curr.text
+      }
+      // bbox 확장
+      curr.bbox = {
+        page: curr.bbox.page,
+        x: Math.min(curr.bbox.x, next.bbox.x),
+        y: Math.min(curr.bbox.y, next.bbox.y),
+        width: Math.max(curr.bbox.x + curr.bbox.width, next.bbox.x + next.bbox.width) - Math.min(curr.bbox.x, next.bbox.x),
+        height: Math.max(curr.bbox.height, next.bbox.height),
+      }
+      blocks.splice(i + 1, 1)
+      // 같은 행에 더 있을 수 있으니 i 안 증가
+    } else {
+      i++
+    }
+  }
+}
+
 /** 한글 균등배분 레이아웃의 글자 간 공백 제거 ("기 본 현 황" → "기본현황") */
 function collapseEvenSpacing(text: string): string {
   const tokens = text.split(" ")
@@ -301,6 +350,252 @@ function collapseEvenSpacing(text: string): string {
     return tokens.join("")
   }
   return text
+}
+
+/**
+ * 다단 레이아웃 아이템을 XY-Cut으로 순서 결정하여 paragraph 블록으로 변환.
+ * normalizeUnderSegmentedTable에서 다단 레이아웃 감지 시 사용.
+ */
+function buildXyCutBlocks(items: NormItem[], pageNum: number): IRBlock[] | null {
+  const allY = items.map(i => i.y)
+  const pageHeight = Math.max(...allY) - Math.min(...allY)
+  const gapThreshold = Math.max(15, pageHeight * 0.03)
+  const orderedGroups = xyCutOrder(items, gapThreshold)
+  const blocks: IRBlock[] = []
+  for (const group of orderedGroups) {
+    if (group.length === 0) continue
+    const yLines = groupByY(group)
+    for (const line of yLines) {
+      const text = mergeLineSimple(line)
+      if (!text.trim()) continue
+      blocks.push({
+        type: "paragraph",
+        text,
+        pageNumber: pageNum,
+        bbox: computeBBox(line, pageNum),
+        style: dominantStyle(line),
+      })
+    }
+  }
+  return blocks.length > 0 ? blocks : null
+}
+
+/**
+ * Under-segmented 테이블 정규화 (ODL TableStructureNormalizer 포팅).
+ *
+ * 선 기반 그리드가 1×1 또는 극소수 셀만 가진 큰 영역일 때,
+ * 내부 텍스트 아이템의 Y좌표 클러스터링으로 행을 재분할하고,
+ * X좌표 갭 분석으로 열을 감지하여 테이블을 재구성한다.
+ *
+ * 트리거 조건:
+ * - 1행 1열 (외곽선만 있는 배경 사각형)
+ * - 또는 셀당 평균 텍스트 행 >= 4 (내부 구조가 부족)
+ */
+function normalizeUnderSegmentedTable(
+  table: IRTable,
+  items: NormItem[],
+  pageNum: number,
+  bbox: BoundingBox,
+): IRBlock[] | null {
+  // 트리거: 1×1 셀이거나, 셀 수 <= 2이고 텍스트가 많은 경우
+  const totalCells = table.cells.reduce((sum, row) =>
+    sum + row.filter(c => c.text.trim()).length, 0)
+  const totalTextLines = table.cells.reduce((sum, row) =>
+    sum + row.reduce((s, c) => s + (c.text.trim() ? c.text.split("\n").length : 0), 0), 0)
+
+  const isUnderSegmented =
+    (table.rows === 1 && table.cols === 1) ||
+    (totalCells <= 2 && totalTextLines >= 8) ||
+    (totalCells <= 2 && items.length >= 6)
+
+  if (!isUnderSegmented) return null
+
+  // 다단 레이아웃이면 XY-Cut으로 읽기 순서 처리 (테이블 오인 방지)
+  if (hasMultiColumnLayout(items)) return buildXyCutBlocks(items, pageNum)
+
+  // 방법 1: 텍스트 Y좌표 + X좌표 갭 기반 직접 행/열 분할 (ODL RowBand 방식)
+  const directTable = buildTableFromTextLayout(items, pageNum, bbox)
+  if (directTable) return directTable
+
+  // 방법 2: cluster-detector fallback
+  const clusterItems: ClusterItem[] = items.map(i => ({
+    text: i.text, x: i.x, y: i.y, w: i.w, h: i.h,
+    fontSize: i.fontSize, fontName: i.fontName,
+  }))
+  const clusterResults = detectClusterTables(clusterItems, pageNum)
+
+  if (clusterResults.length > 0) {
+    const blocks: IRBlock[] = []
+    const ciToIdx = new Map<ClusterItem, number>()
+    for (let ci = 0; ci < clusterItems.length; ci++) ciToIdx.set(clusterItems[ci], ci)
+    const usedIndices = new Set<number>()
+
+    for (const cr of clusterResults) {
+      for (const ci of cr.usedItems) {
+        const idx = ciToIdx.get(ci)
+        if (idx !== undefined) usedIndices.add(idx)
+      }
+      blocks.push({ type: "table", table: cr.table, pageNumber: pageNum, bbox: cr.bbox })
+    }
+
+    const remaining = items.filter((_, idx) => !usedIndices.has(idx))
+    for (const item of remaining) {
+      if (!item.text.trim()) continue
+      blocks.push({
+        type: "paragraph",
+        text: item.text,
+        pageNumber: pageNum,
+        bbox: computeBBox([item], pageNum),
+        style: { fontSize: item.fontSize, fontName: item.fontName },
+      })
+    }
+
+    blocks.sort((a, b) => {
+      const ay = a.bbox ? (a.bbox.y + a.bbox.height) : 0
+      const by = b.bbox ? (b.bbox.y + b.bbox.height) : 0
+      return by - ay
+    })
+
+    return blocks.length > 0 ? blocks : null
+  }
+
+  return null
+}
+
+/**
+ * 텍스트 레이아웃 기반 테이블 구성 (ODL TableStructureNormalizer 핵심).
+ *
+ * 1. Y좌표로 행 그룹핑
+ * 2. 각 행 내 X좌표 갭으로 열 경계 감지
+ * 3. 행 간 공통 열 경계가 2+이면 테이블로 구성
+ * 4. 연속된 줄바꿈 행(동일 라벨)은 이전 행에 병합
+ */
+function buildTableFromTextLayout(
+  items: NormItem[],
+  pageNum: number,
+  bbox: BoundingBox,
+): IRBlock[] | null {
+  if (items.length < 4) return null
+
+  // 1. Y좌표로 행 그룹핑
+  const sorted = [...items].sort((a, b) => b.y - a.y || a.x - b.x)
+  const yTol = 3
+  const rows: NormItem[][] = []
+  let curRow: NormItem[] = [sorted[0]]
+  let curY = sorted[0].y
+
+  for (let i = 1; i < sorted.length; i++) {
+    if (Math.abs(sorted[i].y - curY) <= yTol) {
+      curRow.push(sorted[i])
+    } else {
+      rows.push(curRow)
+      curRow = [sorted[i]]
+      curY = sorted[i].y
+    }
+  }
+  rows.push(curRow)
+
+  if (rows.length < 2) return null
+
+  // 2. X좌표 갭 분석 — 열 경계 감지
+  // 각 행에서 아이템 간 큰 갭 위치 수집
+  const gapPositions: number[] = []
+  for (const row of rows) {
+    if (row.length < 2) continue
+    const sortedX = [...row].sort((a, b) => a.x - b.x)
+    const avgFs = sortedX.reduce((s, i) => s + i.fontSize, 0) / sortedX.length
+    for (let j = 1; j < sortedX.length; j++) {
+      const gap = sortedX[j].x - (sortedX[j - 1].x + sortedX[j - 1].w)
+      if (gap >= avgFs * 1.5) {
+        // 갭의 중간점을 열 경계로 기록
+        gapPositions.push(sortedX[j - 1].x + sortedX[j - 1].w + gap / 2)
+      }
+    }
+  }
+
+  if (gapPositions.length < 2) return null
+
+  // 3. 갭 위치 클러스터링 → 열 경계
+  gapPositions.sort((a, b) => a - b)
+  const colBoundaries: number[] = []
+  let clusterSum = gapPositions[0], clusterCount = 1
+  for (let i = 1; i < gapPositions.length; i++) {
+    const avg = clusterSum / clusterCount
+    if (Math.abs(gapPositions[i] - avg) <= 15) {
+      clusterSum += gapPositions[i]
+      clusterCount++
+    } else {
+      if (clusterCount >= 2) colBoundaries.push(clusterSum / clusterCount)
+      clusterSum = gapPositions[i]
+      clusterCount = 1
+    }
+  }
+  if (clusterCount >= 2) colBoundaries.push(clusterSum / clusterCount)
+
+  if (colBoundaries.length === 0) return null
+
+  // 열 수 = 경계 수 + 1
+  const numCols = colBoundaries.length + 1
+
+  // 4. 행을 열에 배정하여 IRTable 구성
+  // 연속줄(continuation line): 라벨 열이 비어있고 이전 행의 값에 이어지는 행
+  type TableRow = { cells: string[] }
+  const tableRows: TableRow[] = []
+
+  for (const row of rows) {
+    const cells = Array(numCols).fill("")
+    const sortedX = [...row].sort((a, b) => a.x - b.x)
+
+    for (const item of sortedX) {
+      const cx = item.x + item.w / 2
+      let col = 0
+      for (let b = 0; b < colBoundaries.length; b++) {
+        if (cx > colBoundaries[b]) col = b + 1
+      }
+      cells[col] = cells[col] ? cells[col] + " " + item.text : item.text
+    }
+
+    // continuation line 판별: 첫 열이 비어있고 이전 행이 있으면 이전 행에 병합
+    if (cells[0].trim() === "" && tableRows.length > 0) {
+      const prevCells = tableRows[tableRows.length - 1].cells
+      for (let c = 0; c < numCols; c++) {
+        if (cells[c].trim()) {
+          prevCells[c] = prevCells[c]
+            ? prevCells[c] + " " + cells[c].trim()
+            : cells[c].trim()
+        }
+      }
+    } else {
+      tableRows.push({ cells })
+    }
+  }
+
+  if (tableRows.length < 2) return null
+
+  // 검증: 2열 이상 + 3행 이상 or 2행+비어있지않은 셀 비율 > 50%
+  const nonEmptyCount = tableRows.reduce((sum, r) =>
+    sum + r.cells.filter(c => c.trim()).length, 0)
+  const totalCount = tableRows.length * numCols
+  if (nonEmptyCount < totalCount * 0.3) return null
+
+  // IRTable 구성 — 값 셀 선두 bullet 마커(•, ○, -, ·) 정리
+  const irCells: import("../types.js").IRCell[][] = tableRows.map(r =>
+    r.cells.map((text, colIdx) => {
+      let cleaned = text.trim()
+      // 첫 열(라벨)이 아닌 값 셀에서 선두 bullet 제거
+      if (colIdx > 0) cleaned = cleaned.replace(/^[•○·\-]\s*/, "")
+      return { text: cleaned, colSpan: 1, rowSpan: 1 }
+    }),
+  )
+
+  const irTable: IRTable = {
+    rows: tableRows.length,
+    cols: numCols,
+    cells: irCells,
+    hasHeader: tableRows.length > 1,
+  }
+
+  return [{ type: "table", table: irTable, pageNumber: pageNum, bbox }]
 }
 
 /**
@@ -362,6 +657,57 @@ function detectMarkerHeadings(blocks: IRBlock[]): void {
       }
     }
   }
+}
+
+// ═══════════════════════════════════════════════════════
+// 다단(2단) 레이아웃 감지
+// ═══════════════════════════════════════════════════════
+
+/**
+ * 2단 이상 페이지 레이아웃 감지.
+ * 텍스트 영역 중앙에 큰 수직 갭이 있고, 양쪽에 균형잡힌 텍스트가 있으면 다단 레이아웃으로 판단.
+ * 이 경우 detectClusterTables 대신 xyCutOrder로 읽기 순서를 처리한다.
+ *
+ * 판별 기준:
+ * 1. 아이템 30개 이상
+ * 2. 가장 큰 X 갭이 20pt 이상
+ * 3. 갭 위치가 텍스트 영역 중앙 35–65%
+ * 4. 양쪽 각각 15개 이상, 비율 35% 이상
+ */
+function hasMultiColumnLayout(items: NormItem[]): boolean {
+  if (items.length < 30) return false
+
+  const sorted = [...items].sort((a, b) => a.x - b.x)
+  const minX = sorted[0].x
+  let maxX = minX
+  for (const i of sorted) if (i.x + i.w > maxX) maxX = i.x + i.w
+  const pageWidth = maxX - minX
+  if (pageWidth < 200) return false
+
+  // 가장 큰 X 갭 찾기
+  let bestGap = 0
+  let bestSplit = 0
+  for (let j = 1; j < sorted.length; j++) {
+    const gap = sorted[j].x - (sorted[j - 1].x + sorted[j - 1].w)
+    if (gap > bestGap) {
+      bestGap = gap
+      bestSplit = (sorted[j - 1].x + sorted[j - 1].w + sorted[j].x) / 2
+    }
+  }
+
+  if (bestGap < 20) return false
+
+  // 갭이 페이지 중앙 부근 (35–65%)
+  const splitRatio = (bestSplit - minX) / pageWidth
+  if (splitRatio < 0.35 || splitRatio > 0.65) return false
+
+  // 양쪽 텍스트 균형
+  const leftCount = items.filter(i => i.x + i.w / 2 < bestSplit).length
+  const rightCount = items.filter(i => i.x + i.w / 2 >= bestSplit).length
+  if (leftCount < 15 || rightCount < 15) return false
+  if (Math.min(leftCount, rightCount) / Math.max(leftCount, rightCount) < 0.35) return false
+
+  return true
 }
 
 // ═══════════════════════════════════════════════════════
@@ -570,6 +916,14 @@ function extractBlocksWithGrids(
       width: grid.bbox.x2 - grid.bbox.x1, height: grid.bbox.y2 - grid.bbox.y1,
     }
 
+    // Under-segmented 테이블 정규화 (ODL TableStructureNormalizer 포팅):
+    // 1×1 또는 극소수 셀의 큰 그리드 → 내부 텍스트 기반으로 재분할
+    const normalized = normalizeUnderSegmentedTable(irTable, tableItems, pageNum, tableBbox)
+    if (normalized) {
+      blocks.push(...normalized)
+      continue
+    }
+
     // 의사 테이블 필터: 텍스트성 내용 → paragraph로 복원 (구조 보존)
     if (shouldDemoteTable(irTable)) {
       const demoted = demoteTableToText(irTable)
@@ -634,6 +988,12 @@ function mergeAdjacentTableBlocks(blocks: IRBlock[]): IRBlock[] {
 function extractPageBlocksFallback(items: NormItem[], pageNum: number): IRBlock[] {
   if (items.length === 0) return []
 
+  // 다단 레이아웃 우선 확인: detectColumns/detectClusterTables 전에 XY-Cut으로 처리
+  if (hasMultiColumnLayout(items)) {
+    const xyBlocks = buildXyCutBlocks(items, pageNum) || []
+    return detectSpecialKoreanTables(detectListBlocks(xyBlocks))
+  }
+
   const blocks: IRBlock[] = []
 
   // 1단계: 페이지 전체에서 컬럼 감지 (테이블 우선)
@@ -651,7 +1011,8 @@ function extractPageBlocksFallback(items: NormItem[], pageNum: number): IRBlock[
       text: i.text, x: i.x, y: i.y, w: i.w, h: i.h,
       fontSize: i.fontSize, fontName: i.fontName,
     }))
-    const clusterResults = detectClusterTables(clusterItems, pageNum)
+    // 다단 레이아웃이면 클러스터 감지 건너뜀 — xyCutOrder로 처리
+    const clusterResults = hasMultiColumnLayout(items) ? [] : detectClusterTables(clusterItems, pageNum)
 
     if (clusterResults.length > 0) {
       // 클러스터 테이블로 소비된 아이템 추적 (Map 기반 O(n) — 기존 indexOf O(n²) 제거)

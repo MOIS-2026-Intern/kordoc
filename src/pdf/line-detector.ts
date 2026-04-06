@@ -64,12 +64,52 @@ const COORD_MERGE_TOL = 3
 const CONNECT_TOL = 5
 /** 셀 경계 내부 판별 여유 (텍스트 매핑용) */
 const CELL_PADDING = 2
+/** 최대 선 폭 — ODL MAX_LINE_WIDTH=5, 이보다 두꺼우면 장식/배경선으로 무시 */
+const MAX_LINE_WIDTH = 5
+
+// ─── CTM (Current Transformation Matrix) ─────────────
+// 6요소 어파인 행렬 [a, b, c, d, e, f]
+// | a c e |   x' = a*x + c*y + e
+// | b d f |   y' = b*x + d*y + f
+// | 0 0 1 |
+type Matrix6 = [number, number, number, number, number, number]
+
+const IDENTITY: Matrix6 = [1, 0, 0, 1, 0, 0]
+
+function matMultiply(m1: Matrix6, m2: Matrix6): Matrix6 {
+  return [
+    m1[0] * m2[0] + m1[2] * m2[1],
+    m1[1] * m2[0] + m1[3] * m2[1],
+    m1[0] * m2[2] + m1[2] * m2[3],
+    m1[1] * m2[2] + m1[3] * m2[3],
+    m1[0] * m2[4] + m1[2] * m2[5] + m1[4],
+    m1[1] * m2[4] + m1[3] * m2[5] + m1[5],
+  ]
+}
+
+function matTransformPoint(m: Matrix6, x: number, y: number): [number, number] {
+  return [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]]
+}
+
+function matScale(m: Matrix6): number {
+  // ODL: max(sqrt(b²+d²), sqrt(a²+c²))
+  return Math.max(
+    Math.sqrt(m[1] * m[1] + m[3] * m[3]),
+    Math.sqrt(m[0] * m[0] + m[2] * m[2]),
+  )
+}
 
 // ─── 선 추출 ──────────────────────────────────────────
 
 /**
  * pdfjs operatorList에서 수평/수직 선을 추출.
- * constructPath(91) 내의 moveTo→lineTo, rectangle 패턴을 인식.
+ * CTM(Current Transformation Matrix) 추적, filled rectangle→선 변환,
+ * lineTo 4개 시퀀스 사각형 감지를 포함.
+ *
+ * ODL/veraPDF의 ChunkParser.java 참고:
+ * - CTM: save/restore 스택 + transform 연산
+ * - 선 좌표를 CTM으로 변환하여 페이지 좌표계로 통일
+ * - lineWidth도 CTM 스케일 적용
  */
 export function extractLines(
   fnArray: Uint32Array | number[],
@@ -77,13 +117,18 @@ export function extractLines(
 ): { horizontals: LineSegment[]; verticals: LineSegment[] } {
   const horizontals: LineSegment[] = []
   const verticals: LineSegment[] = []
-  let lineWidth = 1
 
-  // 현재 path의 세그먼트를 수집
+  // ── Graphics State (CTM 포함) ──
+  let ctm: Matrix6 = [...IDENTITY] as Matrix6
+  let lineWidth = 1
+  const stateStack: Array<{ ctm: Matrix6; lineWidth: number }> = []
+
+  // 현재 path의 세그먼트를 수집 (user-space 좌표)
   let currentPath: Array<{ x1: number; y1: number; x2: number; y2: number }> = []
   let pathStartX = 0, pathStartY = 0
   let curX = 0, curY = 0
 
+  /** 사각형을 선으로 변환 — 얇으면 단일 선, 두꺼우면 4변 */
   function pushRectangle(
     path: Array<{ x1: number; y1: number; x2: number; y2: number }>,
     rx: number, ry: number, rw: number, rh: number,
@@ -102,10 +147,71 @@ export function extractLines(
     }
   }
 
-  function flushPath(isStroke: boolean) {
-    if (!isStroke) { currentPath = []; return }
+  /**
+   * ODL parsingRectangleFromLines 포팅:
+   * fill 시 4개 lineTo 시퀀스가 닫힌 사각형을 형성하면
+   * 얇은 사각형 → 단일 선으로 변환
+   */
+  function tryConvertLinesToRectangle(
+    path: Array<{ x1: number; y1: number; x2: number; y2: number }>,
+  ): boolean {
+    if (path.length < 3 || path.length > 5) return false
+    // 닫힌 사각형: 첫 세그먼트 시작 == 마지막 세그먼트 끝
+    const first = path[0], last = path[path.length - 1]
+    const closed = Math.abs(first.x1 - last.x2) < 1 && Math.abs(first.y1 - last.y2) < 1
+    if (!closed) return false
+
+    // 바운딩 박스 계산
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+    for (const seg of path) {
+      minX = Math.min(minX, seg.x1, seg.x2)
+      minY = Math.min(minY, seg.y1, seg.y2)
+      maxX = Math.max(maxX, seg.x1, seg.x2)
+      maxY = Math.max(maxY, seg.y1, seg.y2)
+    }
+    const w = maxX - minX, h = maxY - minY
+    if (w < MIN_LINE_LENGTH && h < MIN_LINE_LENGTH) return false
+
+    // 얇은 사각형 → 선으로 변환 (원본 path를 대체)
+    path.length = 0
+    if (h < ORIENTATION_TOL * 2 || (w > MIN_LINE_LENGTH && h <= MAX_LINE_WIDTH)) {
+      path.push({ x1: minX, y1: (minY + maxY) / 2, x2: maxX, y2: (minY + maxY) / 2 })
+    } else if (w < ORIENTATION_TOL * 2 || (h > MIN_LINE_LENGTH && w <= MAX_LINE_WIDTH)) {
+      path.push({ x1: (minX + maxX) / 2, y1: minY, x2: (minX + maxX) / 2, y2: maxY })
+    } else {
+      // 두꺼운 사각형 → 4변 복원
+      pushRectangle(path, minX, minY, w, h)
+    }
+    return true
+  }
+
+  /** path를 CTM 변환 후 선으로 분류 */
+  function flushPath(isStroke: boolean, isFill: boolean) {
+    if (!isStroke && !isFill) { currentPath = []; return }
+
+    // fill 시 lineTo 시퀀스가 사각형을 형성하면 선으로 변환
+    if (isFill && !isStroke && currentPath.length >= 3) {
+      tryConvertLinesToRectangle(currentPath)
+    }
+
+    const scale = matScale(ctm)
+    const effectiveLW = lineWidth * scale
+    // MAX_LINE_WIDTH 필터: 장식/배경선 무시
+    if (effectiveLW > MAX_LINE_WIDTH && isStroke && !isFill) {
+      currentPath = []
+      return
+    }
+
     for (const seg of currentPath) {
-      classifyAndAdd(seg, lineWidth, horizontals, verticals)
+      // CTM 적용: user-space → page-space
+      const [px1, py1] = matTransformPoint(ctm, seg.x1, seg.y1)
+      const [px2, py2] = matTransformPoint(ctm, seg.x2, seg.y2)
+      classifyAndAdd(
+        { x1: px1, y1: py1, x2: px2, y2: py2 },
+        effectiveLW,
+        horizontals,
+        verticals,
+      )
     }
     currentPath = []
   }
@@ -115,17 +221,37 @@ export function extractLines(
     const args = argsArray[i]
 
     switch (op) {
+      // ── Graphics State ──
+      case OPS.save:
+        stateStack.push({ ctm: [...ctm] as Matrix6, lineWidth })
+        break
+
+      case OPS.restore:
+        if (stateStack.length > 0) {
+          const state = stateStack.pop()!
+          ctm = state.ctm
+          lineWidth = state.lineWidth
+        }
+        break
+
+      case OPS.transform: {
+        const m = args as number[]
+        if (m.length >= 6) {
+          ctm = matMultiply(ctm, [m[0], m[1], m[2], m[3], m[4], m[5]])
+        }
+        break
+      }
+
       case OPS.setLineWidth:
         lineWidth = (args as number[])[0] || 1
         break
 
+      // ── Path Construction ──
       case OPS.constructPath: {
         const arg0 = args[0]
 
         if (Array.isArray(arg0)) {
           // ── pdfjs-dist v4 형식 ──
-          // args = [subOps: number[], coords: number[], minMax]
-          // subOps uses OPS constants: moveTo=13, lineTo=14, rectangle=19
           const subOps = arg0 as number[]
           const coords = (args as [number[], number[]])[1]
           let ci = 0
@@ -155,14 +281,10 @@ export function extractLines(
           }
         } else {
           // ── pdfjs-dist v5 형식 ──
-          // args = [afterOp: number, [pathData: object], minMax]
-          // afterOp = OPS.stroke(20), OPS.endPath(28), OPS.fill(22), etc.
-          // pathData uses DrawOPS: moveTo=0, lineTo=1, curveTo=2, closePath=4
           const afterOp = arg0 as number
           const dataArr = args[1] as unknown[]
           const pathData = dataArr?.[0] as Record<number, number> | undefined
           if (pathData && typeof pathData === "object") {
-            // pathData is an object with numeric keys: {0: op, 1: x, 2: y, ...}
             const len = Object.keys(pathData).length
             let di = 0
             while (di < len) {
@@ -190,41 +312,74 @@ export function extractLines(
           }
 
           // v5: afterOp이 stroke/fill이면 즉시 flush
-          if (afterOp === OPS.stroke || afterOp === OPS.closeStroke) {
-            flushPath(true)
-          } else if (afterOp === OPS.fill || afterOp === OPS.eoFill ||
-                     afterOp === OPS.fillStroke || afterOp === OPS.eoFillStroke ||
-                     afterOp === OPS.closeFillStroke || afterOp === OPS.closeEOFillStroke) {
-            flushPath(true)
+          const isStroke5 = afterOp === OPS.stroke || afterOp === OPS.closeStroke
+          const isFill5 = afterOp === OPS.fill || afterOp === OPS.eoFill
+          const isBoth5 = afterOp === OPS.fillStroke || afterOp === OPS.eoFillStroke ||
+                          afterOp === OPS.closeFillStroke || afterOp === OPS.closeEOFillStroke
+          if (isStroke5 || isFill5 || isBoth5) {
+            flushPath(isStroke5 || isBoth5, isFill5 || isBoth5)
           } else if (afterOp === OPS.endPath) {
-            flushPath(false)
+            flushPath(false, false)
           }
         }
         break
       }
 
+      // ── Paint Operations ──
       case OPS.stroke:
       case OPS.closeStroke:
-        flushPath(true)
+        flushPath(true, false)
         break
 
       case OPS.fill:
       case OPS.eoFill:
+        flushPath(false, true)
+        break
+
       case OPS.fillStroke:
       case OPS.eoFillStroke:
       case OPS.closeFillStroke:
       case OPS.closeEOFillStroke:
-        // fill된 사각형도 테이블 선으로 처리 (셀 배경이 아닌 경우)
-        flushPath(true)
+        flushPath(true, true)
         break
 
       case OPS.endPath:
-        flushPath(false)
+        flushPath(false, false)
         break
     }
   }
 
-  return { horizontals, verticals }
+  // 중복 선 제거: CTM 적용 후 동일 위치에 중복된 선 병합
+  return {
+    horizontals: deduplicateLines(horizontals),
+    verticals: deduplicateLines(verticals),
+  }
+}
+
+/** 동일 위치의 중복 선 제거 (CTM 적용 후 fill/stroke 중복 방지) */
+function deduplicateLines(lines: LineSegment[]): LineSegment[] {
+  if (lines.length <= 1) return lines
+  const result: LineSegment[] = []
+  const tol = COORD_MERGE_TOL
+
+  for (const line of lines) {
+    let isDuplicate = false
+    for (const existing of result) {
+      if (Math.abs(line.y1 - existing.y1) <= tol &&
+          Math.abs(line.y2 - existing.y2) <= tol &&
+          Math.abs(line.x1 - existing.x1) <= tol &&
+          Math.abs(line.x2 - existing.x2) <= tol) {
+        // 더 두꺼운 선 유지
+        if (line.lineWidth > existing.lineWidth) {
+          existing.lineWidth = line.lineWidth
+        }
+        isDuplicate = true
+        break
+      }
+    }
+    if (!isDuplicate) result.push(line)
+  }
+  return result
 }
 
 function classifyAndAdd(
