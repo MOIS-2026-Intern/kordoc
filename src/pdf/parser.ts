@@ -541,6 +541,11 @@ function extractBlocksWithGrids(
   const sortedGrids = [...grids].sort((a, b) => b.bbox.y2 - a.bbox.y2)
 
   for (const grid of sortedGrids) {
+    // 1행 다열 그리드는 테이블 헤더일 가능성 높음 → 스킵하여 클러스터 감지에 위임
+    const numGridRows = grid.rowYs.length - 1
+    const numGridCols = grid.colXs.length - 1
+    if (numGridRows === 1 && numGridCols >= 2) continue
+
     // 그리드 영역 내 텍스트 아이템 수집
     const tableItems: NormItem[] = []
     const pad = 3
@@ -612,7 +617,9 @@ function extractBlocksWithGrids(
     if (shouldDemoteTable(irTable)) {
       const demoted = demoteTableToText(irTable)
       if (demoted) {
-        blocks.push({ type: "paragraph", text: demoted, pageNumber: pageNum, bbox: tableBbox, style: dominantStyle(tableItems) })
+        // 텍스트 박스(1x1 또는 1행 그리드) demote 시 앞뒤 줄바꿈으로 본문과 분리
+        const text = numGridRows === 1 ? "\n" + demoted + "\n" : demoted
+        blocks.push({ type: "paragraph", text, pageNumber: pageNum, bbox: tableBbox, style: dominantStyle(tableItems) })
       }
       continue
     }
@@ -621,30 +628,52 @@ function extractBlocksWithGrids(
   }
 
   // 테이블에 속하지 않은 나머지 텍스트 → 일반 블록
-  const remaining = items.filter(i => !usedItems.has(i))
+  let remaining = items.filter(i => !usedItems.has(i))
   if (remaining.length > 0) {
     remaining.sort((a, b) => b.y - a.y || a.x - b.x)
 
-    // XY-Cut으로 왼쪽 본문과 오른쪽 부서명 등을 분리 후 개별 처리
-    const allY = remaining.map(i => i.y)
-    const pageH = Math.max(...allY) - Math.min(...allY)
-    const groups = xyCutOrder(remaining, Math.max(15, pageH * 0.03))
-    const textBlocks: IRBlock[] = []
-    for (const group of groups) {
-      if (group.length === 0) continue
-      const groupBlocks = extractPageBlocksFallback(group, pageNum)
-      for (const b of groupBlocks) textBlocks.push(b)
+    // 클러스터 기반 테이블 감지 (XY-Cut 전에 실행 — 테이블이 쪼개지지 않도록)
+    const clusterItems: ClusterItem[] = remaining.map(i => ({
+      text: i.text, x: i.x, y: i.y, w: i.w, h: i.h,
+      fontSize: i.fontSize, fontName: i.fontName,
+    }))
+    const clusterResults = detectClusterTables(clusterItems, pageNum)
+    if (clusterResults.length > 0) {
+      const ciToIdx = new Map<ClusterItem, number>()
+      for (let ci = 0; ci < clusterItems.length; ci++) ciToIdx.set(clusterItems[ci], ci)
+      const usedClusterIndices = new Set<number>()
+      for (const cr of clusterResults) {
+        for (const ci of cr.usedItems) {
+          const idx = ciToIdx.get(ci)
+          if (idx !== undefined) usedClusterIndices.add(idx)
+        }
+        blocks.push({ type: "table", table: cr.table, pageNumber: pageNum, bbox: cr.bbox })
+      }
+      remaining = remaining.filter((_, idx) => !usedClusterIndices.has(idx))
     }
-    const finalTextBlocks = detectListBlocks(textBlocks)
 
-    // Y좌표 기반으로 테이블과 텍스트를 올바른 순서로 병합
-    const allBlocks = [...blocks, ...finalTextBlocks]
-    allBlocks.sort((a, b) => {
+    // XY-Cut으로 왼쪽 본문과 오른쪽 부서명 등을 분리 후 개별 처리
+    if (remaining.length > 0) {
+      const allY = remaining.map(i => i.y)
+      const pageH = Math.max(...allY) - Math.min(...allY)
+      const groups = xyCutOrder(remaining, Math.max(15, pageH * 0.03))
+      const textBlocks: IRBlock[] = []
+      for (const group of groups) {
+        if (group.length === 0) continue
+        const groupBlocks = extractPageBlocksFallback(group, pageNum)
+        for (const b of groupBlocks) textBlocks.push(b)
+      }
+      const finalTextBlocks = detectListBlocks(textBlocks)
+      for (const b of finalTextBlocks) blocks.push(b)
+    }
+
+    // Y좌표 기반 정렬
+    blocks.sort((a, b) => {
       const ay = a.bbox ? (a.bbox.y + a.bbox.height) : 0
       const by = b.bbox ? (b.bbox.y + b.bbox.height) : 0
       return by - ay // PDF는 y가 위가 큼 → 내림차순
     })
-    return mergeAdjacentTableBlocks(allBlocks)
+    return mergeAdjacentTableBlocks(blocks)
   }
 
   return mergeAdjacentTableBlocks(blocks)
@@ -682,54 +711,51 @@ function extractPageBlocksFallback(items: NormItem[], pageNum: number): IRBlock[
 
   const blocks: IRBlock[] = []
 
-  // 1단계: 페이지 전체에서 컬럼 감지 (테이블 우선)
-  const allYLines = groupByY(items)
-  const columns = detectColumns(allYLines)
+  // 1단계: 클러스터 기반 테이블 감지 우선 (헤더 감지 시 정확도 높음)
+  const clusterItems: ClusterItem[] = items.map(i => ({
+    text: i.text, x: i.x, y: i.y, w: i.w, h: i.h,
+    fontSize: i.fontSize, fontName: i.fontName,
+  }))
+  const clusterResults = detectClusterTables(clusterItems, pageNum)
 
-  if (columns && columns.length >= 3) {
-    // 테이블 감지됨 → 기존 extractWithColumns 로직 사용 (XY-Cut 스킵)
-    const tableText = extractWithColumns(allYLines, columns)
-    const bbox = computeBBox(items, pageNum)
-    blocks.push({ type: "paragraph", text: tableText, pageNumber: pageNum, bbox, style: dominantStyle(items) })
+  if (clusterResults.length > 0) {
+    const ciToIdx = new Map<ClusterItem, number>()
+    for (let ci = 0; ci < clusterItems.length; ci++) ciToIdx.set(clusterItems[ci], ci)
+    const usedIndices = new Set<number>()
+    for (const cr of clusterResults) {
+      for (const ci of cr.usedItems) {
+        const idx = ciToIdx.get(ci)
+        if (idx !== undefined) usedIndices.add(idx)
+      }
+      blocks.push({ type: "table", table: cr.table, pageNumber: pageNum, bbox: cr.bbox })
+    }
+
+    // 테이블에 속하지 않은 나머지 텍스트 → 일반 블록
+    const remaining = items.filter((_, idx) => !usedIndices.has(idx))
+    if (remaining.length > 0) {
+      const yLines = groupByY(remaining)
+      for (const line of yLines) {
+        const text = mergeLineSimple(line)
+        if (!text.trim()) continue
+        const bbox = computeBBox(line, pageNum)
+        blocks.push({ type: "paragraph", text, pageNumber: pageNum, bbox, style: dominantStyle(line) })
+      }
+    }
+
+    blocks.sort((a, b) => {
+      const ay = a.bbox ? (a.bbox.y + a.bbox.height) : 0
+      const by = b.bbox ? (b.bbox.y + b.bbox.height) : 0
+      return by - ay
+    })
   } else {
-    // 2단계: 클러스터 기반 테이블 감지 (2열 이상, 선 없는 PDF)
-    const clusterItems: ClusterItem[] = items.map(i => ({
-      text: i.text, x: i.x, y: i.y, w: i.w, h: i.h,
-      fontSize: i.fontSize, fontName: i.fontName,
-    }))
-    const clusterResults = detectClusterTables(clusterItems, pageNum)
+    // 2단계: 레거시 컬럼 감지 (3+ 열)
+    const allYLines = groupByY(items)
+    const columns = detectColumns(allYLines)
 
-    if (clusterResults.length > 0) {
-      // 클러스터 테이블로 소비된 아이템 추적 (Map 기반 O(n) — 기존 indexOf O(n²) 제거)
-      const ciToIdx = new Map<ClusterItem, number>()
-      for (let ci = 0; ci < clusterItems.length; ci++) ciToIdx.set(clusterItems[ci], ci)
-      const usedIndices = new Set<number>()
-      for (const cr of clusterResults) {
-        for (const ci of cr.usedItems) {
-          const idx = ciToIdx.get(ci)
-          if (idx !== undefined) usedIndices.add(idx)
-        }
-        blocks.push({ type: "table", table: cr.table, pageNumber: pageNum, bbox: cr.bbox })
-      }
-
-      // 테이블에 속하지 않은 나머지 텍스트 → 일반 블록
-      const remaining = items.filter((_, idx) => !usedIndices.has(idx))
-      if (remaining.length > 0) {
-        const yLines = groupByY(remaining)
-        for (const line of yLines) {
-          const text = mergeLineSimple(line)
-          if (!text.trim()) continue
-          const bbox = computeBBox(line, pageNum)
-          blocks.push({ type: "paragraph", text, pageNumber: pageNum, bbox, style: dominantStyle(line) })
-        }
-      }
-
-      // Y좌표 기준 정렬
-      blocks.sort((a, b) => {
-        const ay = a.bbox ? (a.bbox.y + a.bbox.height) : 0
-        const by = b.bbox ? (b.bbox.y + b.bbox.height) : 0
-        return by - ay
-      })
+    if (columns && columns.length >= 3) {
+      const tableText = extractWithColumns(allYLines, columns)
+      const bbox = computeBBox(items, pageNum)
+      blocks.push({ type: "paragraph", text: tableText, pageNumber: pageNum, bbox, style: dominantStyle(items) })
     } else {
       // 3단계: XY-Cut으로 읽기 순서 결정
       const allY = items.map(i => i.y)
@@ -742,7 +768,6 @@ function extractPageBlocksFallback(items: NormItem[], pageNum: number): IRBlock[
         if (group.length === 0) continue
         const yLines = groupByY(group)
 
-        // 그룹 내에서도 컬럼 감지 시도 (소형 테이블)
         const groupColumns = detectColumns(yLines)
         if (groupColumns && groupColumns.length >= 3) {
           const tableText = extractWithColumns(yLines, groupColumns)
@@ -1259,6 +1284,12 @@ function mergeLineSimple(items: NormItem[]): string {
       result += sorted[i].text
       continue
     }
+    // 마커(□○▶ 등) 뒤에 한글이 오면 항상 공백 보장 — "□장소" → "□ 장소"
+    if (/[□■○●▶◆◇ㅇ]$/.test(sorted[i - 1].text) && /^[가-힣]/.test(sorted[i].text) && gap > 1) {
+      result += " "
+      result += sorted[i].text
+      continue
+    }
     // 매우 작은 갭 — 공백 없이 붙임
     if (gap < avgFs * 0.15) { /* no space */ }
     // 한글 관련 작은 갭 — PDF 문자 개별 배치 잔재
@@ -1276,6 +1307,8 @@ function mergeLineSimple(items: NormItem[]): string {
 export function cleanPdfText(text: string): string {
   return mergeKoreanLines(
     text
+      // 문서 시작 단독 페이지 번호
+      .replace(/^\d{1,4}\n/, "")
       // "- 2 -" 스타일 페이지 번호 (독립 라인 및 목록 항목 형태 포함)
       .replace(/^[\s]*[-–—]\s*[-–—]?\d+[-–—]?[\s]*[-–—]?[\s]*$/gm, "")
       // "1 / 5" 스타일 페이지 번호
@@ -1284,9 +1317,13 @@ export function cleanPdfText(text: string): string {
       .replace(/\n\d{1,4}\n/g, "\n")
       // 문서 마지막 단독 페이지 번호
       .replace(/\n\d{1,4}$/, "")
+      // 단독 숫자 헤딩 제거 ("# 6\n재무과" → "\n재무과")
+      .replace(/^#{1,6}\s*\d{1,4}\s*$/gm, "")
   )
     // 균등배분 문자열 후처리 (pdfjs가 합친 TextItem + buildGridTable 셀 텍스트)
     .replace(/^(?!\| ---).*$/gm, line => collapseEvenSpacing(line))
+    // 마커 뒤 2글자 균등배분 합침 ("□ 일 시" → "□ 일시", "□ 장 소" → "□ 장소")
+    .replace(/([□■◆○●▶ㅇ])\s+([가-힣])\s+([가-힣])/g, "$1 $2$3")
     .replace(/\n{3,}/g, "\n\n")
     .trim()
 }

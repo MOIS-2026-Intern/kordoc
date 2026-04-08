@@ -9,14 +9,13 @@
  * Modifications: TypeScript 재구현, 최소 2열 감지, 한국어 PDF 특화 최적화.
  *
  * 핵심 아이디어:
- * 1. 텍스트 아이템을 baseline(Y좌표)으로 그룹핑하여 행(row) 구성
- * 2. 각 행의 아이템 X좌표를 수집, 행 간 공통 X좌표 클러스터(열) 감지
- * 3. 2+ 열이 3+ 행에 걸쳐 일관되면 테이블로 판정
- * 4. 기존 detectColumns(min 3열)보다 느슨한 기준(min 2열)으로
- *    2열 테이블(key-value 등)도 감지
+ * 1. 균등배분(개별 글자) 아이템을 사전 병합하여 노이즈 제거
+ * 2. 헤더 행(짧은 라벨 + 넓은 갭) 감지 → 열 앵커로 사용
+ * 3. 헤더 없으면 기존 X좌표 클러스터링으로 열 감지
+ * 4. 다중행 셀(같은 논리 행이 여러 Y에 걸침) 병합
  */
 
-import type { IRBlock, IRTable, IRCell, BoundingBox } from "../types.js"
+import type { IRTable, IRCell, BoundingBox } from "../types.js"
 
 /** parser.ts의 NormItem과 동일한 인터페이스 */
 export interface ClusterItem {
@@ -32,15 +31,15 @@ export interface ClusterItem {
 // ─── 상수 ──────────────────────────────────────────────
 /** baseline 그룹핑 허용 오차 (pt) */
 const Y_TOL = 3
-/** 열 클러스터링 허용 오차 (pt) — detectColumns의 CLUSTER_TOL=22보다 엄격 */
+/** 열 클러스터링 허용 오차 (pt) */
 const COL_CLUSTER_TOL = 15
 /** 테이블로 인정하기 위한 최소 행 수 */
-const MIN_ROWS = 4
+const MIN_ROWS = 3
 /** 테이블로 인정하기 위한 최소 열 수 */
 const MIN_COLS = 2
 /** 같은 행 내 아이템 간 최소 갭 (테이블 컬럼 구분) — fontSize 배수 */
 const MIN_GAP_FACTOR = 2.0
-/** 같은 행 내 아이템 간 최소 갭 절대값 (pt) — 텍스트 박스 들여쓰기 오탐 방지 */
+/** 같은 행 내 아이템 간 최소 갭 절대값 (pt) */
 const MIN_GAP_ABSOLUTE = 20
 /** 열에 값이 있는 행의 비율 최소 기준 */
 const MIN_COL_FILL_RATIO = 0.4
@@ -55,6 +54,12 @@ interface ColCluster {
   count: number   // 이 열에 속한 아이템 수
 }
 
+/** 헤더 감지 결과: 열 앵커 + 헤더 행 인덱스 */
+interface HeaderResult {
+  columns: ColCluster[]
+  headerIdx: number
+}
+
 export interface ClusterTableResult {
   table: IRTable
   bbox: BoundingBox
@@ -63,37 +68,213 @@ export interface ClusterTableResult {
 
 /**
  * 클러스터 기반 테이블 감지. 선이 없는 PDF의 fallback 경로에서 호출.
- *
- * @param items 페이지의 텍스트 아이템 (Y 내림차순 정렬)
- * @param pageNum 페이지 번호
- * @returns 감지된 테이블들 (없으면 빈 배열)
  */
 export function detectClusterTables(items: ClusterItem[], pageNum: number): ClusterTableResult[] {
   if (items.length < MIN_ROWS * MIN_COLS) return []
 
+  // 0. 균등배분 아이템 사전 병합 (개별 글자 → 단어)
+  const { merged, originMap } = mergeEvenSpacedClusters(items)
+
   // 1. Y좌표로 행 그룹핑
-  const rows = groupByBaseline(items)
+  const rows = groupByBaseline(merged)
   if (rows.length < MIN_ROWS) return []
 
-  // 2. "의심스러운" 행 식별 — 아이템 간 큰 갭이 있는 행
-  const suspiciousRows = rows.filter(row => hasSuspiciousGaps(row))
-  if (suspiciousRows.length < MIN_ROWS) return []
-
-  // 3. 의심스러운 행들의 X좌표에서 열 클러스터 추출
-  const columns = extractColumnClusters(suspiciousRows)
-  if (columns.length < MIN_COLS) return []
-
-  // 4. 연속된 의심스러운 행들을 테이블 영역으로 그룹화
-  const tableRegions = findTableRegions(rows, columns)
   const results: ClusterTableResult[] = []
 
-  for (const region of tableRegions) {
-    const table = buildClusterTable(region.rows, columns, pageNum)
-    if (table) results.push(table)
+  // 2. 헤더 행 기반 열 감지 시도
+  const headerResult = detectHeaderRow(rows)
+
+  if (headerResult) {
+    // 헤더 기반: 헤더 이후 행에서 boundary 기반 열 구조 매칭
+    const { columns, headerIdx } = headerResult
+    const headerRow = rows[headerIdx]
+    const headerItems = [...headerRow.items].sort((a, b) => a.x - b.x)
+    const headerAndBelow = rows.slice(headerIdx)
+    // 다중행 셀 병합
+    const mergedRows = mergeMultiLineRows(headerAndBelow, columns)
+    // boundary 기반 region 탐색 (proximity 대신 headerItems 범위 사용)
+    const tableRegions = findTableRegionsByHeader(mergedRows, columns, headerItems)
+    for (const region of tableRegions) {
+      const table = buildClusterTable(region.rows, columns, pageNum)
+      if (table) {
+        expandUsedItems(table.usedItems, originMap)
+        results.push(table)
+      }
+    }
+  }
+
+  if (results.length === 0) {
+    // 3. 기존 방식: suspicious gaps + column clustering
+    const suspiciousRows = rows.filter(row => hasSuspiciousGaps(row))
+    if (suspiciousRows.length >= MIN_ROWS) {
+      const columns = extractColumnClusters(suspiciousRows)
+      if (columns.length >= MIN_COLS) {
+        const tableRegions = findTableRegions(rows, columns)
+        for (const region of tableRegions) {
+          const mergedRows = mergeMultiLineRows(region.rows, columns)
+          const table = buildClusterTable(mergedRows, columns, pageNum)
+          if (table) {
+            expandUsedItems(table.usedItems, originMap)
+            results.push(table)
+          }
+        }
+      }
+    }
   }
 
   return results
 }
+
+// ─── 균등배분 사전 병합 ──────────────────────────────────
+
+/** 균등배분(1글자+균일간격) 아이템을 단어 단위로 병합. 원본→병합 매핑도 반환. */
+function mergeEvenSpacedClusters(
+  items: ClusterItem[],
+): { merged: ClusterItem[]; originMap: Map<ClusterItem, ClusterItem[]> } {
+  const originMap = new Map<ClusterItem, ClusterItem[]>()
+  const rows = groupByBaseline(items)
+  const merged: ClusterItem[] = []
+
+  for (const row of rows) {
+    const sorted = [...row.items].sort((a, b) => a.x - b.x)
+    let i = 0
+    while (i < sorted.length) {
+      if (/^[가-힣\d]$/.test(sorted[i].text)) {
+        let runEnd = i + 1
+        while (runEnd < sorted.length && /^[가-힣\d]$/.test(sorted[runEnd].text)) {
+          const gap = sorted[runEnd].x - (sorted[runEnd - 1].x + sorted[runEnd - 1].w)
+          const fs = sorted[runEnd].fontSize
+          if (gap < fs * 0.1 || gap > fs * 3) break
+          runEnd++
+        }
+        if (runEnd - i >= 3) {
+          const gaps: number[] = []
+          for (let g = i + 1; g < runEnd; g++) {
+            gaps.push(sorted[g].x - (sorted[g - 1].x + sorted[g - 1].w))
+          }
+          const minG = Math.min(...gaps), maxG = Math.max(...gaps)
+          if (minG > 0 && maxG / minG <= 3) {
+            const run = sorted.slice(i, runEnd)
+            const text = run.map(r => r.text).join("")
+            const first = run[0], last = run[runEnd - i - 1]
+            const item: ClusterItem = {
+              text, x: first.x, y: first.y,
+              w: (last.x + last.w) - first.x, h: first.h,
+              fontSize: first.fontSize, fontName: first.fontName,
+            }
+            originMap.set(item, run)
+            merged.push(item)
+            i = runEnd
+            continue
+          }
+        }
+      }
+      merged.push(sorted[i])
+      i++
+    }
+  }
+  return { merged, originMap }
+}
+
+/** 병합된 ClusterItem의 usedItems를 원본 아이템으로 확장 */
+function expandUsedItems(usedItems: Set<ClusterItem>, originMap: Map<ClusterItem, ClusterItem[]>): void {
+  const toAdd: ClusterItem[] = []
+  for (const item of usedItems) {
+    const origins = originMap.get(item)
+    if (origins) for (const o of origins) toAdd.push(o)
+  }
+  for (const a of toAdd) usedItems.add(a)
+}
+
+// ─── 헤더 행 기반 열 감지 ───────────────────────────────
+
+/**
+ * 상위 행에서 테이블 헤더 후보를 탐색.
+ * 조건: 2~6개 짧은 아이템, 최소 1개 큰 갭(>2.5x fontSize), 넓은 X 범위,
+ * 한글 포함, 후속 행에서 최소 MIN_ROWS개가 헤더 열에 매칭
+ */
+function detectHeaderRow(rows: RowGroup[]): HeaderResult | null {
+  const allItems = rows.flatMap(r => r.items)
+  if (allItems.length === 0) return null
+  const allMinX = Math.min(...allItems.map(i => i.x))
+  const allMaxX = Math.max(...allItems.map(i => i.x + i.w))
+  const pageSpan = allMaxX - allMinX
+  if (pageSpan <= 0) return null
+
+  // 전체 행에서 헤더 후보 탐색 — 가드가 충분히 엄격하므로 범위 제한 불필요
+  for (let ri = 0; ri < rows.length; ri++) {
+    const row = rows[ri]
+    // 2~6 아이템
+    if (row.items.length < MIN_COLS || row.items.length > 6) continue
+    // 모든 아이템 짧아야 함 (각 8자 이내)
+    if (row.items.some(i => i.text.length > 8)) continue
+    // 한글 포함 아이템이 최소 1개
+    if (!row.items.some(i => /[가-힣]/.test(i.text))) continue
+    // 마커(□○●·※▶-) 시작 아이템 제외
+    if (row.items.some(i => /^[□■○●·※▶▷◆◇\-]/.test(i.text))) continue
+
+    const sorted = [...row.items].sort((a, b) => a.x - b.x)
+    const xSpan = (sorted[sorted.length - 1].x + sorted[sorted.length - 1].w) - sorted[0].x
+
+    // X 범위가 전체의 40%+ 차지
+    if (xSpan / pageSpan < 0.4) continue
+
+    // 최소 1개 갭이 avgFontSize의 2.5배 이상
+    const avgFs = sorted.reduce((s, i) => s + i.fontSize, 0) / sorted.length
+    let hasLargeGap = false
+    for (let i = 1; i < sorted.length; i++) {
+      const gap = sorted[i].x - (sorted[i - 1].x + sorted[i - 1].w)
+      if (gap >= avgFs * 2.5) { hasLargeGap = true; break }
+    }
+    if (!hasLargeGap) continue
+
+    // 열 앵커 생성
+    const columns: ColCluster[] = sorted.map(item => ({ x: item.x, count: 0 }))
+
+    // 후속 행 검증: 헤더 이후 MIN_ROWS+ 행이 2+ 열에 매칭
+    let matchCount = 0
+    for (let j = ri + 1; j < rows.length && matchCount < MIN_ROWS + 2; j++) {
+      const matched = countMatchedColumnsRange(rows[j], columns, sorted)
+      if (matched >= MIN_COLS) matchCount++
+    }
+    if (matchCount < MIN_ROWS) continue
+
+    return { columns, headerIdx: ri }
+  }
+  return null
+}
+
+// ─── 다중행 셀 병합 ────────────────────────────────────
+
+/** 연속 행에서 MIN_COLS 미만 열만 사용하고 Y갭이 작으면 이전 행에 병합 */
+function mergeMultiLineRows(rows: RowGroup[], columns: ColCluster[]): RowGroup[] {
+  if (rows.length <= 1) return rows
+  const result: RowGroup[] = [rows[0]]
+  const allFontSizes = rows.flatMap(r => r.items).map(i => i.fontSize)
+  const avgFontSize = allFontSizes.length > 0
+    ? allFontSizes.reduce((s, v) => s + v, 0) / allFontSizes.length : 12
+
+  for (let i = 1; i < rows.length; i++) {
+    const prev = result[result.length - 1]
+    const curr = rows[i]
+    const yGap = Math.abs(prev.y - curr.y)
+    const matchedCols = countMatchedColumns(curr, columns)
+
+    // 병합 조건: Y갭이 작고 + 아이템 수가 적음 (연속 행 = 1~2개 아이템)
+    // 아이템이 많은 행(3+)은 독립적인 데이터 행 → 병합하지 않음
+    if (yGap < avgFontSize * 1.8 && curr.items.length <= 2 && (matchedCols < MIN_COLS || curr.items.length === 1)) {
+      result[result.length - 1] = {
+        y: prev.y,
+        items: [...prev.items, ...curr.items],
+      }
+    } else {
+      result.push(curr)
+    }
+  }
+  return result
+}
+
+// ─── 기본 유틸 ──────────────────────────────────────────
 
 /** 아이템을 baseline(Y좌표)으로 그룹핑 */
 function groupByBaseline(items: ClusterItem[]): RowGroup[] {
@@ -123,6 +304,9 @@ function hasSuspiciousGaps(row: RowGroup): boolean {
   if (row.items.length < 2) return false
 
   const sorted = [...row.items].sort((a, b) => a.x - b.x)
+  // 가드: 2아이템 행에서 두 번째 아이템이 긴 텍스트면 들여쓰기 단락
+  if (sorted.length === 2 && sorted[1].text.length > 20) return false
+
   const avgFontSize = sorted.reduce((s, i) => s + i.fontSize, 0) / sorted.length
   const minGap = Math.max(avgFontSize * MIN_GAP_FACTOR, MIN_GAP_ABSOLUTE)
 
@@ -133,16 +317,14 @@ function hasSuspiciousGaps(row: RowGroup): boolean {
   return false
 }
 
-/** 의심스러운 행들의 X좌표에서 열 클러스터 추출 (sort-and-split 방식, 순서 무관) */
+/** 의심스러운 행들의 X좌표에서 열 클러스터 추출 */
 function extractColumnClusters(rows: RowGroup[]): ColCluster[] {
-  // 모든 X좌표 수집
   const allX: number[] = []
   for (const row of rows) {
     for (const item of row.items) allX.push(item.x)
   }
   if (allX.length === 0) return []
 
-  // 정렬 후 갭 기반 분할
   allX.sort((a, b) => a - b)
 
   const clusters: ColCluster[] = []
@@ -150,7 +332,6 @@ function extractColumnClusters(rows: RowGroup[]): ColCluster[] {
 
   for (let i = 1; i <= allX.length; i++) {
     if (i === allX.length || allX[i] - allX[i - 1] > COL_CLUSTER_TOL) {
-      // 클러스터 완성: [clusterStart, i)
       const slice = allX.slice(clusterStart, i)
       const avg = Math.round(slice.reduce((s, v) => s + v, 0) / slice.length)
       clusters.push({ x: avg, count: slice.length })
@@ -158,11 +339,56 @@ function extractColumnClusters(rows: RowGroup[]): ColCluster[] {
     }
   }
 
-  // 최소 빈도 필터 — 행 수의 30% 이상 등장해야 유효한 열
   const minCount = Math.max(2, Math.floor(rows.length * MIN_COL_FILL_RATIO))
   return clusters
     .filter(c => c.count >= minCount)
     .sort((a, b) => a.x - b.x)
+}
+
+/** 헤더 기반 테이블 영역 찾기 — boundary 기반 열 매칭, 관대한 종료 조건 */
+function findTableRegionsByHeader(
+  allRows: RowGroup[], columns: ColCluster[], headerItems: ClusterItem[],
+): { rows: RowGroup[] }[] {
+  const regions: { rows: RowGroup[] }[] = []
+  let currentRegion: RowGroup[] = []
+  let missStreak = 0 // 연속 비매칭 행 수
+
+  for (const row of allRows) {
+    const matchedCols = countMatchedColumnsRange(row, columns, headerItems)
+    if (matchedCols >= MIN_COLS) {
+      currentRegion.push(row)
+      missStreak = 0
+    } else if (currentRegion.length > 0 && (row.items.length <= 2 || missStreak === 0)) {
+      // 단일 비매칭은 허용 (multi-line 셀 or 단일 아이템)
+      currentRegion.push(row)
+      missStreak++
+    } else {
+      // 연속 2+ 비매칭 → 테이블 종료
+      // 끝에 붙은 비매칭 행 제거
+      while (currentRegion.length > 0) {
+        const last = currentRegion[currentRegion.length - 1]
+        if (countMatchedColumnsRange(last, columns, headerItems) >= MIN_COLS) break
+        currentRegion.pop()
+      }
+      if (currentRegion.length >= MIN_ROWS) {
+        regions.push({ rows: [...currentRegion] })
+      }
+      currentRegion = []
+      missStreak = 0
+    }
+  }
+
+  // 끝에 붙은 비매칭 행 정리
+  while (currentRegion.length > 0) {
+    const last = currentRegion[currentRegion.length - 1]
+    if (countMatchedColumnsRange(last, columns, headerItems) >= MIN_COLS) break
+    currentRegion.pop()
+  }
+  if (currentRegion.length >= MIN_ROWS) {
+    regions.push({ rows: currentRegion })
+  }
+
+  return regions
 }
 
 /** 연속된 테이블 행 영역 찾기 */
@@ -171,17 +397,14 @@ function findTableRegions(allRows: RowGroup[], columns: ColCluster[]): { rows: R
   let currentRegion: RowGroup[] = []
 
   for (const row of allRows) {
-    // 이 행이 열 구조에 맞는지 확인
     const matchedCols = countMatchedColumns(row, columns)
     if (matchedCols >= MIN_COLS) {
       currentRegion.push(row)
     } else if (row.items.length === 1) {
-      // 단일 아이템 행 — 병합 셀이거나 헤더일 수 있음
       if (currentRegion.length > 0) {
         currentRegion.push(row)
       }
     } else {
-      // 비테이블 행 → 현재 영역 종료
       if (currentRegion.length >= MIN_ROWS) {
         regions.push({ rows: [...currentRegion] })
       }
@@ -196,7 +419,7 @@ function findTableRegions(allRows: RowGroup[], columns: ColCluster[]): { rows: R
   return regions
 }
 
-/** 행의 아이템이 몇 개의 열에 매칭되는지 */
+/** 행의 아이템이 몇 개의 열에 매칭되는지 (X좌표 근접) */
 function countMatchedColumns(row: RowGroup, columns: ColCluster[]): number {
   const matched = new Set<number>()
   for (const item of row.items) {
@@ -210,19 +433,121 @@ function countMatchedColumns(row: RowGroup, columns: ColCluster[]): number {
   return matched.size
 }
 
-/** 아이템을 열에 배정. 거리 제한 초과 시 -1 반환. */
-function assignToColumn(item: ClusterItem, columns: ColCluster[]): number {
-  const MAX_DIST = COL_CLUSTER_TOL * 3
-  let bestCol = -1
-  let bestDist = Infinity
-  for (let ci = 0; ci < columns.length; ci++) {
-    const dist = Math.abs(item.x - columns[ci].x)
-    if (dist < bestDist) {
-      bestDist = dist
-      bestCol = ci
+/**
+ * 범위 기반 열 매칭 — 헤더 아이템의 x~x+w 범위 내에 있는지 확인.
+ * 헤더 열 간 중간점을 경계로 사용하여 넓은 범위 매칭.
+ */
+function countMatchedColumnsRange(
+  row: RowGroup, columns: ColCluster[], headerItems: ClusterItem[],
+): number {
+  // 열 경계 계산: 헤더 아이템 사이 중간점
+  const boundaries: { left: number; right: number }[] = []
+  for (let ci = 0; ci < headerItems.length; ci++) {
+    const left = ci === 0 ? 0 : (headerItems[ci - 1].x + headerItems[ci - 1].w + headerItems[ci].x) / 2
+    const right = ci === headerItems.length - 1
+      ? Infinity
+      : (headerItems[ci].x + headerItems[ci].w + headerItems[ci + 1].x) / 2
+    boundaries.push({ left, right })
+  }
+
+  const matched = new Set<number>()
+  for (const item of row.items) {
+    for (let ci = 0; ci < boundaries.length; ci++) {
+      if (item.x >= boundaries[ci].left && item.x < boundaries[ci].right) {
+        matched.add(ci)
+        break
+      }
     }
   }
-  return bestDist <= MAX_DIST ? bestCol : -1
+  return matched.size
+}
+
+/**
+ * 행별 갭 분석으로 아이템을 열에 배정.
+ *
+ * 전역 경계선 대신 각 행을 개별 분석:
+ * 1) 행 내 N-1개의 가장 큰 갭으로 N개 그룹 분할
+ * 2) 각 그룹의 중심 X를 헤더 열 중심과 비교하여 최적 열 배정
+ * 3) 갭이 불충분한 행(아이템 적음)은 헤더 중간점 기반 fallback
+ *
+ * 이 방식은 열 폭이 행마다 달라도 정확하게 분리.
+ */
+function assignRowItems(
+  items: ClusterItem[], columns: ColCluster[], numCols: number,
+): { col: number; items: ClusterItem[] }[] {
+  if (items.length === 0) return []
+  const sorted = [...items].sort((a, b) => a.x - b.x)
+
+  // 헤더 열 중심 좌표
+  const colCenters = columns.map(c => c.x)
+
+  // 행 내 갭 계산
+  const gaps: { idx: number; size: number }[] = []
+  for (let i = 1; i < sorted.length; i++) {
+    gaps.push({ idx: i, size: sorted[i].x - (sorted[i - 1].x + sorted[i - 1].w) })
+  }
+
+  // N-1개의 가장 큰 갭 선택 — 적응형 임계값
+  // 아이템이 적은 행(헤더, 라벨 행): 낮은 절대 임계값 (모든 갭이 유의미할 가능성 높음)
+  // 아이템이 많은 행(본문 데이터): 상대적 임계값 (워드 갭 vs 컬럼 갭 구분)
+  const gapSizes = gaps.map(g => g.size).sort((a, b) => a - b)
+  const medianGap = gapSizes.length > 0 ? gapSizes[Math.floor(gapSizes.length / 2)] : 0
+  const gapThreshold = sorted.length <= numCols + 1
+    ? 12  // 희소 행: 낮은 절대 임계값
+    : Math.max(medianGap * 2.5, 12) // 밀집 행: 상대적 임계값
+  const significantGaps = gaps
+    .filter(g => g.size >= gapThreshold)
+    .sort((a, b) => b.size - a.size)
+    .slice(0, numCols - 1)
+    .sort((a, b) => a.idx - b.idx) // 위치 순 복원
+
+  // 가용 갭으로 그룹 분할 (갭이 부족해도 있는 만큼 분할)
+  const groups: ClusterItem[][] = []
+  let start = 0
+  for (const gap of significantGaps) {
+    groups.push(sorted.slice(start, gap.idx))
+    start = gap.idx
+  }
+  groups.push(sorted.slice(start))
+
+  // 각 그룹 → 가장 가까운 헤더 열에 배정
+  const result: { col: number; items: ClusterItem[] }[] = []
+  const usedCols = new Set<number>()
+  // 그룹별 중심 X 계산
+  const groupCenters = groups.map(g => {
+    const minX = Math.min(...g.map(i => i.x))
+    const maxX = Math.max(...g.map(i => i.x + i.w))
+    return (minX + maxX) / 2
+  })
+
+  // 탐욕적 배정: 각 그룹을 가장 가까운 미사용 열에 배정
+  const assignments: { gi: number; ci: number; dist: number }[] = []
+  for (let gi = 0; gi < groups.length; gi++) {
+    for (let ci = 0; ci < numCols; ci++) {
+      assignments.push({ gi, ci, dist: Math.abs(groupCenters[gi] - colCenters[ci]) })
+    }
+  }
+  assignments.sort((a, b) => a.dist - b.dist)
+
+  const assignedGroups = new Set<number>()
+  for (const { gi, ci } of assignments) {
+    if (assignedGroups.has(gi) || usedCols.has(ci)) continue
+    result.push({ col: ci, items: groups[gi] })
+    assignedGroups.add(gi)
+    usedCols.add(ci)
+  }
+  // 남은 그룹 (numGroups > numCols인 경우 — 가장 가까운 열에 추가)
+  for (let gi = 0; gi < groups.length; gi++) {
+    if (assignedGroups.has(gi)) continue
+    let bestCol = 0, bestDist = Infinity
+    for (let ci = 0; ci < numCols; ci++) {
+      const d = Math.abs(groupCenters[gi] - colCenters[ci])
+      if (d < bestDist) { bestDist = d; bestCol = ci }
+    }
+    result.push({ col: bestCol, items: groups[gi] })
+  }
+
+  return result
 }
 
 /** 클러스터 테이블을 IRTable로 구성 */
@@ -236,7 +561,6 @@ function buildClusterTable(
 
   if (numRows < MIN_ROWS || numCols < MIN_COLS) return null
 
-  // 셀 그리드 구성
   const cells: IRCell[][] = Array.from(
     { length: numRows },
     () => Array.from({ length: numCols }, () => ({ text: "", colSpan: 1, rowSpan: 1 })),
@@ -253,12 +577,13 @@ function buildClusterTable(
       continue
     }
 
-    for (const item of row.items) {
-      const col = assignToColumn(item, columns)
-      if (col < 0) continue // 열에 매칭 안 되는 아이템은 무시
+    // 행별 갭 분석 기반 열 배정
+    const assignments = assignRowItems(row.items, columns, numCols)
+    for (const { col, items } of assignments) {
+      const text = items.map(i => i.text).join(" ")
       const existing = cells[r][col].text
-      cells[r][col].text = existing ? existing + " " + item.text : item.text
-      usedItems.add(item)
+      cells[r][col].text = existing ? existing + " " + text : text
+      for (const item of items) usedItems.add(item)
     }
   }
 
@@ -275,11 +600,60 @@ function buildClusterTable(
     if (!hasValue) return null
   }
 
+  // 후처리 1: 단일 열 연속 행 → 이전 행에 역방향 병합 (multi-line 셀)
+  // 조건: 1개 열만 내용 + col0 비어있음 + 리스트 마커(○-·)로 시작하지 않음
+  for (let r = numRows - 1; r >= 1; r--) {
+    const nonEmptyCols = cells[r].filter(c => c.text.trim()).length
+    if (nonEmptyCols !== 1) continue
+    if (cells[r][0].text.trim() !== "") continue
+    const contentText = cells[r].find(c => c.text.trim())?.text.trim() || ""
+    // 리스트 마커로 시작하면 새 항목 → 병합하지 않음
+    if (/^[○●▶\-·]/.test(contentText)) continue
+    for (let pr = r - 1; pr >= 0; pr--) {
+      if (cells[pr].some(c => c.text.trim())) {
+        for (let c = 0; c < numCols; c++) {
+          const prev = cells[pr][c].text.trim()
+          const curr = cells[r][c].text.trim()
+          if (curr) cells[pr][c].text = prev ? prev + " " + curr : curr
+        }
+        for (let c = 0; c < numCols; c++) cells[r][c].text = ""
+        break
+      }
+    }
+  }
+
+  // 후처리 2: 번호만 있는 행(col0+마지막열만 값) → 다음 내용 행과 순방향 병합
+  // 예: 목차 "|3|||3|" + "|청사 내 에너지...|행정지원과||" → "|3|청사...|행정지원과|3|"
+  for (let r = 0; r < cells.length - 1; r++) {
+    const row = cells[r]
+    const hasCol0 = row[0].text.trim() !== ""
+    const hasColLast = numCols > 1 && row[numCols - 1].text.trim() !== ""
+    const midEmpty = row.slice(1, numCols - 1).every(c => c.text.trim() === "")
+    if (hasCol0 && hasColLast && midEmpty) {
+      // 다음 행에 col0이 비어있으면 병합
+      const next = cells[r + 1]
+      if (next[0].text.trim() === "" && next.some(c => c.text.trim())) {
+        for (let c = 1; c < numCols; c++) {
+          const curr = next[c].text.trim()
+          if (curr) row[c].text = row[c].text.trim() ? row[c].text.trim() + " " + curr : curr
+        }
+        for (let c = 0; c < numCols; c++) next[c].text = ""
+      }
+    }
+  }
+
+  // 빈 행 제거
+  const filteredCells = cells.filter(row => row.some(c => c.text.trim()))
+  const finalRowCount = filteredCells.length
+
+  // 검증
+  if (finalRowCount < MIN_ROWS) return null
+
   const irTable: IRTable = {
-    rows: numRows,
+    rows: finalRowCount,
     cols: numCols,
-    cells,
-    hasHeader: numRows > 1,
+    cells: filteredCells,
+    hasHeader: finalRowCount > 1,
   }
 
   // BBox 계산
