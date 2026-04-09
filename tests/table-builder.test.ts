@@ -94,7 +94,7 @@ describe("blocksToMarkdown", () => {
     assert.ok(md.includes("*(제10조제2항 관련)*"))
   })
 
-  it("colSpan 병합 셀은 첫 열에만 텍스트, 나머지 빈칸", () => {
+  it("colSpan 병합 셀은 HTML <table>로 출력", () => {
     const blocks: IRBlock[] = [
       {
         type: "table",
@@ -105,11 +105,14 @@ describe("blocksToMarkdown", () => {
       },
     ]
     const md = blocksToMarkdown(blocks)
-    assert.ok(md.includes("| 병합셀 |"), "colSpan 병합 셀 텍스트가 첫 열에 존재")
-    assert.ok(md.includes("| 값1 | 값2 |"))
+    assert.ok(md.includes("<table>"), "병합 테이블은 HTML로 출력")
+    assert.ok(md.includes('colspan="2"'), "colSpan 속성 포함")
+    assert.ok(md.includes("병합셀"), "병합 셀 텍스트 존재")
+    assert.ok(md.includes("값1"))
+    assert.ok(md.includes("값2"))
   })
 
-  it("rowSpan 병합 셀은 빈 칸으로 유지", () => {
+  it("rowSpan 병합 셀은 HTML <table>로 출력", () => {
     const blocks: IRBlock[] = [
       {
         type: "table",
@@ -121,8 +124,10 @@ describe("blocksToMarkdown", () => {
       },
     ]
     const md = blocksToMarkdown(blocks)
-    assert.ok(md.includes("| 행병합 | 값1 |"), "rowSpan 원본 셀은 내용 표시")
-    assert.ok(md.includes("|  | 값2 |"), "rowSpan 병합 위치는 빈 칸")
+    assert.ok(md.includes("<table>"), "병합 테이블은 HTML로 출력")
+    assert.ok(md.includes('rowspan="2"'), "rowSpan 속성 포함")
+    assert.ok(md.includes("행병합"))
+    assert.ok(md.includes("값2"))
   })
 
   it("테이블 블록을 마크다운 테이블로 변환", () => {

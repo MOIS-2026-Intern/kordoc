@@ -322,10 +322,59 @@ export function blocksToMarkdown(blocks: IRBlock[]): string {
   return lines.join("\n").trim()
 }
 
+/** 병합 셀 존재 여부 확인 */
+function hasMergedCells(table: IRTable): boolean {
+  for (const row of table.cells) {
+    for (const cell of row) {
+      if (cell.colSpan > 1 || cell.rowSpan > 1) return true
+    }
+  }
+  return false
+}
+
+/** 병합 테이블 → HTML <table> 출력 (rowspan/colspan 보존) */
+function tableToHtml(table: IRTable): string {
+  const { cells, rows: numRows, cols: numCols } = table
+  const skip = new Set<string>()
+  const lines: string[] = ["<table>"]
+
+  for (let r = 0; r < numRows; r++) {
+    const tag = r === 0 ? "th" : "td"
+    const rowHtml: string[] = []
+    for (let c = 0; c < numCols; c++) {
+      if (skip.has(`${r},${c}`)) continue
+      const cell = cells[r]?.[c]
+      if (!cell) continue
+
+      // 병합 영역 skip 마킹
+      for (let dr = 0; dr < cell.rowSpan; dr++) {
+        for (let dc = 0; dc < cell.colSpan; dc++) {
+          if (dr === 0 && dc === 0) continue
+          if (r + dr < numRows && c + dc < numCols) skip.add(`${r + dr},${c + dc}`)
+        }
+      }
+
+      const text = sanitizeText(cell.text).replace(/\n/g, "<br>")
+      const attrs: string[] = []
+      if (cell.colSpan > 1) attrs.push(`colspan="${cell.colSpan}"`)
+      if (cell.rowSpan > 1) attrs.push(`rowspan="${cell.rowSpan}"`)
+      const attrStr = attrs.length ? " " + attrs.join(" ") : ""
+      rowHtml.push(`<${tag}${attrStr}>${text}</${tag}>`)
+    }
+    if (rowHtml.length) lines.push(`<tr>${rowHtml.join("")}</tr>`)
+  }
+
+  lines.push("</table>")
+  return lines.join("\n")
+}
+
 function tableToMarkdown(table: IRTable): string {
   if (table.rows === 0 || table.cols === 0) return ""
 
   const { cells, rows: numRows, cols: numCols } = table
+
+  // 병합 셀이 있으면 HTML 테이블로 출력
+  if (hasMergedCells(table)) return tableToHtml(table)
 
   // 1행 1열 → 구조화된 텍스트 (빈 셀이면 스킵)
   if (numRows === 1 && numCols === 1) {
