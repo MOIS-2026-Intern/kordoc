@@ -3,25 +3,27 @@
 import type { IRBlock, IRTable, FormField, FormResult } from "../types.js"
 
 /** 한국 공문서 필드 라벨 키워드 */
-const LABEL_KEYWORDS = new Set([
+export const LABEL_KEYWORDS = new Set([
   "성명", "이름", "주소", "전화", "전화번호", "휴대폰", "핸드폰", "연락처",
   "생년월일", "주민등록번호", "소속", "직위", "직급", "부서",
   "이메일", "팩스", "학교", "학년", "반", "번호",
   "신청인", "대표자", "담당자", "작성자", "확인자", "승인자",
   "일시", "날짜", "기간", "장소", "목적", "사유", "비고",
   "금액", "수량", "단가", "합계", "계", "소계",
+  "등록기준지", "본적", "위임인", "청구사유", "소명자료",
 ])
 
 /** 라벨처럼 보이는 셀인지 판별 */
 export function isLabelCell(text: string): boolean {
-  const trimmed = text.trim()
+  // 각주 번호/특수문자 제거 후 판별 (예: "등록기준지²" → "등록기준지")
+  const trimmed = text.trim().replace(/[¹²³⁴⁵⁶⁷⁸⁹⁰*※]+$/g, "").trim()
   if (!trimmed || trimmed.length > 30) return false
   // 키워드 매칭
   for (const kw of LABEL_KEYWORDS) {
     if (trimmed.includes(kw)) return true
   }
-  // 짧은 한글 텍스트 (2-8자) + 숫자 없음
-  if (/^[가-힣\s()·:]{2,8}$/.test(trimmed) && !/\d/.test(trimmed)) return true
+  // 짧은 한글 텍스트 (2-8자) + 숫자 없음 (공백/괄호/특수기호 허용)
+  if (/^[가-힣\s()（）·:：]+$/.test(trimmed) && trimmed.replace(/\s/g, "").length >= 2 && trimmed.replace(/\s/g, "").length <= 8 && !/\d/.test(trimmed)) return true
   // "라벨:" 패턴
   if (/^[가-힣A-Za-z\s]+[:：]$/.test(trimmed)) return true
   return false

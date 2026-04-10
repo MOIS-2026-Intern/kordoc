@@ -179,7 +179,10 @@ program
         if (fieldsStr.startsWith("{")) {
           values = JSON.parse(fieldsStr)
         } else {
-          for (const pair of fieldsStr.split(",")) {
+          // "key1=value1,key2=value2" 파싱 — 값에 쉼표가 있을 수 있으므로
+          // '=' 앞의 키를 기준으로 분리 (쉼표+한글/영문+= 패턴)
+          const pairs = fieldsStr.split(/,(?=[가-힣A-Za-z][가-힣A-Za-z\s]*=)/)
+          for (const pair of pairs) {
             const eqIdx = pair.indexOf("=")
             if (eqIdx > 0) {
               const key = pair.slice(0, eqIdx).trim()

@@ -2,6 +2,7 @@
 
 import type { IRBlock, IRTable, FormField } from "../types.js"
 import { isLabelCell } from "./recognize.js"
+import { normalizeLabel, findMatchingKey, normalizeValues, resolveUnmatched, isKeywordLabel, fillInCellPatterns } from "./match.js"
 
 /** 필드 채우기 결과 */
 export interface FillResult {
@@ -17,7 +18,7 @@ export interface FillResult {
  * IRBlock[]에서 양식 필드를 찾아 값을 교체.
  *
  * @param blocks 원본 IRBlock[] (변경하지 않음 — deep clone)
- * @param values 채울 값 맵 (라벨 → 새 값). 라벨은 부분 매칭 지원.
+ * @param values 채울 값 맵 (라벨 → 새 값). 라벨은 접두사 매칭 지원.
  * @returns FillResult
  *
  * @example
@@ -40,41 +41,43 @@ export function fillFormFields(
   const filled: FormField[] = []
   const matchedLabels = new Set<string>()
 
-  // 입력 라벨 정규화 (콜론/공백 제거)
-  const normalizedValues = new Map<string, string>()
-  for (const [label, value] of Object.entries(values)) {
-    normalizedValues.set(normalizeLabel(label), value)
-  }
+  const normalizedValues = normalizeValues(values)
 
-  // 1) 테이블 기반 필드 교체
+  // 1) 인셀 패턴 먼저 (체크박스, 괄호 빈칸, 어노테이션) — 전략 2가 덮어쓰기 전에
+  const patternFilledCells = new Set<string>()  // "r,c" 키
   for (const block of cloned) {
     if (block.type !== "table" || !block.table) continue
-    fillTable(block.table, normalizedValues, filled, matchedLabels)
+    for (let r = 0; r < block.table.rows; r++) {
+      for (let c = 0; c < block.table.cols; c++) {
+        const cell = block.table.cells[r]?.[c]
+        if (!cell) continue
+        const result = fillInCellPatterns(cell.text, normalizedValues, matchedLabels)
+        if (result) {
+          cell.text = result.text
+          patternFilledCells.add(`${r},${c}`)
+          for (const m of result.matches) {
+            filled.push({ label: m.label, value: m.value, row: r, col: c })
+          }
+        }
+      }
+    }
   }
 
-  // 2) 인라인 "라벨: 값" 패턴 교체
+  // 2) 테이블 기반 필드 교체 (라벨-값 셀 패턴)
+  for (const block of cloned) {
+    if (block.type !== "table" || !block.table) continue
+    fillTable(block.table, normalizedValues, filled, matchedLabels, patternFilledCells)
+  }
+
+  // 3) 인라인 "라벨: 값" 패턴 교체
   for (const block of cloned) {
     if (block.type !== "paragraph" || !block.text) continue
     const newText = fillInlineFields(block.text, normalizedValues, filled, matchedLabels)
     if (newText !== block.text) block.text = newText
   }
 
-  const unmatched = [...normalizedValues.keys()]
-    .filter(k => !matchedLabels.has(k))
-    .map(k => {
-      // 원본 라벨 키 복원
-      for (const orig of Object.keys(values)) {
-        if (normalizeLabel(orig) === k) return orig
-      }
-      return k
-    })
-
+  const unmatched = resolveUnmatched(normalizedValues, matchedLabels, values)
   return { blocks: cloned, filled, unmatched }
-}
-
-/** 라벨 정규화 — 비교용 */
-function normalizeLabel(label: string): string {
-  return label.trim().replace(/[:：\s]/g, "")
 }
 
 /** 테이블 셀에서 라벨-값 패턴을 찾아 값 교체 */
@@ -83,29 +86,34 @@ function fillTable(
   values: Map<string, string>,
   filled: FormField[],
   matchedLabels: Set<string>,
+  patternFilledCells?: Set<string>,
 ): void {
   if (table.cols < 2) return
 
+  // 전략 1: 인접 라벨-값 셀 패턴
   for (let r = 0; r < table.rows; r++) {
     for (let c = 0; c < table.cols - 1; c++) {
       const labelCell = table.cells[r][c]
       const valueCell = table.cells[r][c + 1]
       if (!labelCell || !valueCell) continue
 
-      // 라벨 셀 검증 — isLabelCell이 아니면 데이터 셀이므로 스킵
       if (!isLabelCell(labelCell.text)) continue
+
+      if (isKeywordLabel(valueCell.text)) continue
 
       const normalizedCellLabel = normalizeLabel(labelCell.text)
       if (!normalizedCellLabel) continue
 
-      // 정확 매칭 → 부분 매칭 순
       const matchKey = findMatchingKey(normalizedCellLabel, values)
       if (matchKey === undefined) continue
 
       const newValue = values.get(matchKey)!
-      const oldValue = valueCell.text.trim()
-
-      valueCell.text = newValue
+      // 이미 인셀 패턴이 처리된 셀이면 앞에 삽입 (어노테이션 보존)
+      if (patternFilledCells?.has(`${r},${c + 1}`)) {
+        valueCell.text = newValue + " " + valueCell.text
+      } else {
+        valueCell.text = newValue
+      }
       matchedLabels.add(matchKey)
       filled.push({
         label: labelCell.text.trim().replace(/[:：]\s*$/, ""),
@@ -116,20 +124,22 @@ function fillTable(
     }
   }
 
-  // 헤더+데이터 행 패턴 (첫 행 전부 라벨)
-  if (filled.length === 0 && table.rows >= 2 && table.cols >= 2) {
+  // 전략 2: 헤더+데이터 행 패턴 (첫 행이 전부 라벨이면)
+  // 전략 1에서 이미 채운 필드는 스킵 (matchedLabels 검사)
+  if (table.rows >= 2 && table.cols >= 2) {
     const headerRow = table.cells[0]
-    const allShortText = headerRow.every(cell => {
+    const allLabels = headerRow.every(cell => {
       const t = cell.text.trim()
-      return t.length > 0 && t.length <= 20
+      return t.length > 0 && t.length <= 20 && isLabelCell(t)
     })
-    if (!allShortText) return
+    if (!allLabels) return
 
     for (let r = 1; r < table.rows; r++) {
       for (let c = 0; c < table.cols; c++) {
         const headerLabel = normalizeLabel(headerRow[c].text)
         const matchKey = findMatchingKey(headerLabel, values)
         if (matchKey === undefined) continue
+        if (matchedLabels.has(matchKey)) continue
 
         const newValue = values.get(matchKey)!
         table.cells[r][c].text = newValue
@@ -145,17 +155,6 @@ function fillTable(
   }
 }
 
-/** 정확 매칭 → 포함 매칭 순으로 키 검색 */
-function findMatchingKey(cellLabel: string, values: Map<string, string>): string | undefined {
-  // 정확 매칭
-  if (values.has(cellLabel)) return cellLabel
-  // 포함 매칭 (셀 라벨이 입력 키를 포함하거나, 입력 키가 셀 라벨을 포함)
-  for (const key of values.keys()) {
-    if (cellLabel.includes(key) || key.includes(cellLabel)) return key
-  }
-  return undefined
-}
-
 /** 인라인 "라벨: 값" 패턴 교체 */
 function fillInlineFields(
   text: string,
@@ -165,7 +164,7 @@ function fillInlineFields(
 ): string {
   return text.replace(
     /([가-힣A-Za-z]{2,10})\s*[:：]\s*([^\n,;]{0,100})/g,
-    (match, rawLabel: string, oldValue: string) => {
+    (match, rawLabel: string, _oldValue: string) => {
       const normalized = normalizeLabel(rawLabel)
       const matchKey = findMatchingKey(normalized, values)
       if (matchKey === undefined) return match

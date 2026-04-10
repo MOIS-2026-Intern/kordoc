@@ -444,16 +444,18 @@ server.tool(
           hwpxResult.unmatched.length > 0 ? `매칭 실패: ${hwpxResult.unmatched.join(", ")}` : null,
         ].filter(Boolean).join(" | ")
 
+        const filledList = hwpxResult.filled.map(f => `  - ${f.label}: ${f.value}`).join("\n")
+
         if (output_path) {
           mkdirSync(dirname(resolve(output_path)), { recursive: true })
           writeFileSync(resolve(output_path), Buffer.from(hwpxResult.buffer))
           return {
-            content: [{ type: "text", text: `[${summary}]\n\nHWPX 파일 저장 (원본 서식 유지): ${resolve(output_path)}` }],
+            content: [{ type: "text", text: `[${summary}]\n\n채워진 필드:\n${filledList}\n\nHWPX 파일 저장 (원본 서식 유지): ${resolve(output_path)}` }],
           }
         }
 
         return {
-          content: [{ type: "text", text: `[${summary}]\n\n⚠️ output_path를 지정하면 원본 서식이 유지된 HWPX 파일로 저장됩니다.` }],
+          content: [{ type: "text", text: `[${summary}]\n\n채워진 필드:\n${filledList}\n\n⚠️ output_path를 지정하면 원본 서식이 유지된 HWPX 파일로 저장됩니다.` }],
         }
       }
 
