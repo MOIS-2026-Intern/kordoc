@@ -30,6 +30,9 @@ Beyond simple text extraction, kordoc automates the **entire lifecycle of Korean
 ## What's New in v2.3.0
 
 - **📄 HWPML 2.x Parser** — Added support for XML-based HWP files (`.hwp` in XML format). Government documents that previously returned "unsupported format" are now fully parsed to Markdown. Auto-detected by XML signature (`<?xml` + `<HWPML`), separate from HWP 5.x binary files.
+- **🧩 Nested Table Markers** — HWPX/HWP5 now insert `[중첩 테이블 #N]` markers where nested tables appear inside cells. Large nested tables (≥3 rows + ≥2 cols) are split into separate blocks; small ones are flattened inline. HWP5 previously dropped nested table content entirely — now preserved via markers.
+- **🖼️ HWPX Image Extraction Fix** — Fixed images being silently dropped when `binaryItemIDRef` was stored without an extension (e.g. `"image1"`). ZIP entries are now resolved via regex matching.
+- **📄 PDF Header/Footer Detection** — Hybrid text-repeat + y-position clustering. Dynamic headers (per-page chapter titles etc.) are now caught via position signals even when text varies. Zone widened from 10% to 12%.
 
 <details>
 <summary>v2.2.4 changes</summary>
