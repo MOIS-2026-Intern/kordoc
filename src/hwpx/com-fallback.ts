@@ -64,13 +64,19 @@ try {
     $t = $hwp.GetPageText($p, 0)
     $result.pages += @($t)
   }
-  $hwp.Clear(1)
+  $hwp.Clear(1) | Out-Null
+  try { $hwp.Quit() | Out-Null } catch { }
   [System.Runtime.InteropServices.Marshal]::ReleaseComObject($hwp) | Out-Null
+  [GC]::Collect()
+  [GC]::WaitForPendingFinalizers()
   $result | ConvertTo-Json -Depth 3 -Compress
 } catch {
   @{ error = $_.Exception.Message } | ConvertTo-Json -Compress
 } finally {
+  # 임시 파일 정리 + 좀비 Hwp.exe 방지용 garbage collect
   try { Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+  [GC]::Collect()
+  [GC]::WaitForPendingFinalizers()
 }
 `
 
