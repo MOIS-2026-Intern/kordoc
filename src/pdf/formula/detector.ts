@@ -16,8 +16,13 @@ import type { FormulaKind, PixelFrame, FormulaRegion } from "./types.js"
 const MFD_IMG_SIZE = 768
 const MFD_NUM_CLASSES = 2
 const MFD_CHANNELS = 4 + MFD_NUM_CLASSES
-const MFD_CONF_THRESHOLD = 0.25
+/** 기본 confidence 임계값 (Pix2Text 원본 0.25 — 누락은 적지만 noise 발생) */
+const MFD_CONF_INLINE = 0.30
+/** display 수식 임계값 — diagram/figure 오탐 감소 목적으로 inline 보다 높게 */
+const MFD_CONF_DISPLAY = 0.40
 const MFD_IOU_THRESHOLD = 0.45
+/** 최소 bbox 면적 (px²) — 이보다 작으면 OCR noise 가능성 높음 */
+const MFD_MIN_AREA = 80
 const PAD_VALUE = 114 / 255
 
 interface RawDetection {
@@ -79,7 +84,9 @@ export async function detectFormulaRegions(
         bestCls = c
       }
     }
-    if (bestScore < MFD_CONF_THRESHOLD) continue
+    // 클래스별 임계값 — display 쪽은 diagram/figure 오탐 감소 목적으로 inline 보다 엄격.
+    const threshold = bestCls === 1 ? MFD_CONF_DISPLAY : MFD_CONF_INLINE
+    if (bestScore < threshold) continue
 
     // letterbox → 원본 좌표
     let x1 = (cx - w / 2 - padX) / scale
@@ -93,6 +100,8 @@ export async function detectFormulaRegions(
     y2 = clamp(y2, 0, frame.height - 1)
 
     if (x2 - x1 < 2 || y2 - y1 < 2) continue
+    // 너무 작은 bbox (픽셀 단위 noise 로 보이는 영역) 제외
+    if ((x2 - x1) * (y2 - y1) < MFD_MIN_AREA) continue
 
     candidates.push({
       x1,
