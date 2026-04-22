@@ -51,8 +51,24 @@ export async function markdownToHwpx(markdown: string): Promise<ArrayBuffer> {
   zip.file("Contents/content.hpf", generateManifest())
   zip.file("Contents/header.xml", generateHeaderXml())
   zip.file("Contents/section0.xml", sectionXml)
+  // Preview/ — 한글 프로그램의 일부 버전(특히 macOS)이 존재 여부를 확인함
+  zip.file("Preview/PrvText.txt", buildPrvText(blocks))
 
   return await zip.generateAsync({ type: "arraybuffer" })
+}
+
+/** Preview/PrvText.txt — 문서 앞부분 텍스트 스냅샷 (최대 1KB) */
+function buildPrvText(blocks: MdBlock[]): string {
+  const lines: string[] = []
+  let bytes = 0
+  for (const b of blocks) {
+    const text = b.text || (b.rows ? b.rows.map(r => r.join(" ")).join("\n") : "")
+    if (!text) continue
+    lines.push(text)
+    bytes += text.length * 3
+    if (bytes > 1024) break
+  }
+  return lines.join("\n").slice(0, 1024)
 }
 
 // ─── 마크다운 파싱 ───────────────────────────────────
@@ -349,7 +365,7 @@ function generateHeaderXml(): string {
         </hh:font>
       </hh:fontface>
     </hh:fontfaces>
-    <hh:borderFills itemCnt="1">
+    <hh:borderFills itemCnt="2">
       <hh:borderFill id="0" threeD="0" shadow="0" centerLine="0" breakCellSeparateLine="0">
         <hh:slash type="NONE" Crooked="0" isCounter="0"/>
         <hh:backSlash type="NONE" Crooked="0" isCounter="0"/>
@@ -357,6 +373,16 @@ function generateHeaderXml(): string {
         <hh:rightBorder type="NONE" width="0.1mm" color="#000000"/>
         <hh:topBorder type="NONE" width="0.1mm" color="#000000"/>
         <hh:bottomBorder type="NONE" width="0.1mm" color="#000000"/>
+        <hh:diagonal type="NONE" width="0.1mm" color="#000000"/>
+        <hh:fillInfo/>
+      </hh:borderFill>
+      <hh:borderFill id="1" threeD="0" shadow="0" centerLine="0" breakCellSeparateLine="0">
+        <hh:slash type="NONE" Crooked="0" isCounter="0"/>
+        <hh:backSlash type="NONE" Crooked="0" isCounter="0"/>
+        <hh:leftBorder type="SOLID" width="0.12mm" color="#000000"/>
+        <hh:rightBorder type="SOLID" width="0.12mm" color="#000000"/>
+        <hh:topBorder type="SOLID" width="0.12mm" color="#000000"/>
+        <hh:bottomBorder type="SOLID" width="0.12mm" color="#000000"/>
         <hh:diagonal type="NONE" width="0.1mm" color="#000000"/>
         <hh:fillInfo/>
       </hh:borderFill>
@@ -412,16 +438,59 @@ function generateSecPr(): string {
 }
 
 // ─── 테이블 생성 ─────────────────────────────────────
+//
+// HWPX 스펙 완전 준수 버전 — 한글 프로그램(Windows/macOS)이 문서를 거부하지 않으려면
+// <hp:tbl> 필수 속성 + <hp:sz>/<hp:pos>/<hp:outMargin>/<hp:inMargin> + 각 cell의
+// <hp:subList> 래퍼, <hp:cellAddr>, <hp:cellSz>, <hp:cellMargin>이 전부 있어야 함.
+// 또한 테이블은 paragraph 안의 <hp:run><hp:ctrl>... 로 감싸야 한다.
+//
+// 이슈 #4 참고: v2.4.1 이전엔 최소 스켈레톤만 내서 macOS 한글이 "파일이 깨졌다"며 거부.
+
+// 기본 셀 크기 (HWPUnit) — A4 기준 적당한 기본값
+const TABLE_ID_BASE = 1000
+let tableIdCounter = TABLE_ID_BASE
+function nextTableId(): number { return ++tableIdCounter }
 
 function generateTable(rows: string[][]): string {
-  const trElements = rows.map(row => {
-    const tdElements = row.map(cell => {
+  const rowCnt = rows.length
+  const colCnt = Math.max(...rows.map(r => r.length), 1)
+  // A4 portrait: 폭 약 44000 HWPUnit 사용 가능 → colCnt로 균등 분배
+  const cellW = Math.floor(44000 / colCnt)
+  const cellH = 1500  // 기본 행 높이
+  const tblW = cellW * colCnt
+  const tblH = cellH * rowCnt
+
+  const tblId = nextTableId()
+
+  const trElements = rows.map((row, rowIdx) => {
+    // 부족한 셀은 빈 문자열로 채워 colCnt 맞춤
+    const cells = row.length < colCnt ? [...row, ...Array(colCnt - row.length).fill("")] : row
+    const tdElements = cells.map((cell, colIdx) => {
       const runs = generateRuns(cell)
-      return `<hp:tc><hp:cellSpan colSpan="1" rowSpan="1"/><hp:p paraPrIDRef="0" styleIDRef="0">${runs}</hp:p></hp:tc>`
+      const p = `<hp:p paraPrIDRef="0" styleIDRef="0">${runs}</hp:p>`
+      // <hp:tc> 필수 속성 + subList + cellAddr + cellSpan + cellSz + cellMargin
+      return `<hp:tc name="" header="${rowIdx === 0 ? 1 : 0}" hasMargin="0" protect="0" editable="1" dirty="0" borderFillIDRef="1">`
+        + `<hp:subList id="" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="TOP" linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0">${p}</hp:subList>`
+        + `<hp:cellAddr colAddr="${colIdx}" rowAddr="${rowIdx}"/>`
+        + `<hp:cellSpan colSpan="1" rowSpan="1"/>`
+        + `<hp:cellSz width="${cellW}" height="${cellH}"/>`
+        + `<hp:cellMargin left="141" right="141" top="141" bottom="141"/>`
+        + `</hp:tc>`
     }).join("")
     return `<hp:tr>${tdElements}</hp:tr>`
   }).join("")
-  return `<hp:tbl>${trElements}</hp:tbl>`
+
+  // <hp:tbl>에 필수 속성 + <hp:sz>/<hp:outMargin>/<hp:inMargin> (pos는 inline-level 기준)
+  const tblInner = `<hp:sz width="${tblW}" widthRelTo="ABSOLUTE" height="${tblH}" heightRelTo="ABSOLUTE" protect="0"/>`
+    + `<hp:pos treatAsChar="1" affectLSpacing="0" flowWithText="0" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PARA" horzRelTo="PARA" vertAlign="TOP" horzAlign="LEFT" vertOffset="0" horzOffset="0"/>`
+    + `<hp:outMargin left="0" right="0" top="0" bottom="0"/>`
+    + `<hp:inMargin left="510" right="510" top="141" bottom="141"/>`
+    + trElements
+
+  const tbl = `<hp:tbl id="${tblId}" zOrder="0" numberingType="TABLE" pageBreak="CELL" repeatHeader="0" rowCnt="${rowCnt}" colCnt="${colCnt}" cellSpacing="0" borderFillIDRef="1" noShading="0">${tblInner}</hp:tbl>`
+
+  // 테이블은 paragraph 안의 run → 가 아니라 별도 p로 감쌈 (block-level inline-anchored)
+  return `<hp:p paraPrIDRef="0" styleIDRef="0"><hp:run charPrIDRef="0">${tbl}</hp:run></hp:p>`
 }
 
 // ─── 섹션 XML 생성 ──────────────────────────────────

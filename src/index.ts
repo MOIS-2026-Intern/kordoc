@@ -8,6 +8,8 @@ import { readFile } from "fs/promises"
 import { detectFormat, detectZipFormat, isHwpxFile, isOldHwpFile, isPdfFile, isZipFile } from "./detect.js"
 import { parseHwpxDocument } from "./hwpx/parser.js"
 import { parseHwp5Document } from "./hwp5/parser.js"
+import { isComFallbackAvailable, extractTextViaCom, comResultToParseResult } from "./hwpx/com-fallback.js"
+import { isDistributionSentinel } from "./hwp5/sentinel.js"
 // pdfjs-dist는 optional peer dep (37MB) — PDF 안 쓰는 사용자를 위해 dynamic import
 // import { parsePdfDocument } from "./pdf/parser.js"
 import { parseXlsxDocument } from "./xlsx/parser.js"
@@ -98,6 +100,28 @@ export async function parseHwpx(buffer: ArrayBuffer, options?: ParseOptions): Pr
 export async function parseHwp(buffer: ArrayBuffer, options?: ParseOptions): Promise<ParseResult> {
   try {
     const { markdown, blocks, metadata, outline, warnings, images } = parseHwp5Document(Buffer.from(buffer), options)
+
+    // 배포용 HWP 5.x 감지 — 본문이 "상위 버전의 배포용 문서입니다..." 플레이스홀더뿐이면
+    // COM fallback으로 재시도 (Windows + 한컴오피스 환경에서만). 이슈 #25 대응.
+    if (isDistributionSentinel(markdown) && isComFallbackAvailable() && options?.filePath) {
+      try {
+        const { pages, pageCount, warnings: comWarns } = extractTextViaCom(options.filePath)
+        if (pages.some(p => p && p.trim().length > 0)) {
+          const com = comResultToParseResult(pages, pageCount, comWarns)
+          return {
+            success: true,
+            fileType: "hwp",
+            markdown: com.markdown,
+            blocks: com.blocks,
+            metadata: com.metadata,
+            warnings: com.warnings,
+          }
+        }
+      } catch {
+        // COM 실패 시 기존 결과(경고 문자열 포함) 그대로 반환
+      }
+    }
+
     return { success: true, fileType: "hwp", markdown, blocks, metadata, outline, warnings, images: images?.length ? images : undefined }
   } catch (err) {
     return { success: false, fileType: "hwp", error: err instanceof Error ? err.message : "HWP 파싱 실패", code: classifyError(err) }

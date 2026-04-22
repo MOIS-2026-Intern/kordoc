@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0] - 2026-04-22
+
+HWPX 생성기 스펙 완전 준수 + HWP 배포용 문서 COM fallback 확장.
+
+### Fixed
+- **`markdownToHwpx` HWPX 스펙 준수** (#4) — 생성된 HWPX가 macOS 한컴오피스에서 "파일이 깨졌다" 거부되던 이슈 해결. 테이블 XML을 최소 스켈레톤에서 완전 스펙 형태로 재작성:
+  - `<hp:tbl>` 필수 속성 전부 추가 (`id`, `zOrder`, `numberingType`, `pageBreak`, `repeatHeader`, `rowCnt`, `colCnt`, `cellSpacing`, `borderFillIDRef`, `noShading`)
+  - `<hp:sz>` / `<hp:pos>` / `<hp:outMargin>` / `<hp:inMargin>` 블록 추가
+  - 각 `<hp:tc>`에 `<hp:subList>` 래퍼 + `<hp:cellAddr>` / `<hp:cellSpan>` / `<hp:cellSz>` / `<hp:cellMargin>` 추가
+  - `<hp:tbl>`을 `<hp:p><hp:run>...` 로 감싸 paragraph-anchored 방식으로 배치
+- **header.xml borderFill id=1 추가** — 테이블 실제 테두리 렌더링용 (SOLID 0.12mm)
+- **`Preview/PrvText.txt` 생성** — macOS 한컴이 확인하는 경로. 문서 앞부분 텍스트 스냅샷 1KB 이내
+
+### Added
+- **HWP 5.x 배포용 문서 COM fallback 확장** (#25) — `.hwp` 바이너리에서 "이 문서는 상위 버전의 배포용 문서입니다..." 경고 플레이스홀더만 나오는 케이스에서, Windows + 한컴오피스 환경이면 자동으로 `HWPFrame.HwpObject` COM API로 재시도. 기존 HWPX DRM fallback 인프라 재활용.
+  - 새 모듈 `src/hwp5/sentinel.ts` — 경고 문자열 패턴 감지 (3개 정규식)
+  - `parseHwp()`가 `options.filePath` 있으면 자동 트리거
+  - 정상 본문이 섞인 문서는 sentinel=false → fallback 건너뜀
+
+### Technical notes
+- Windows + 한컴오피스가 없는 환경에서는 기존 경고 문자열이 그대로 노출됨 (behavior unchanged)
+- 테스트 4건 추가 (`tests/sentinel.test.ts`) — 226/226 pass
+
 ## [2.4.1] - 2026-04-19
 
 MCP 설치 경험 개선. 한 줄 마법사로 AI 에이전트 연동 자동화.
