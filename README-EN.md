@@ -27,9 +27,17 @@ Beyond simple text extraction, kordoc automates the **entire lifecycle of Korean
 
 ---
 
-## What's New in v2.4.0
+## What's New in v2.5.0
+
+- **🏛️ macOS Hancom Compatibility Fix (#4)** — Fixed `markdownToHwpx()` output being rejected by macOS Hancom Office as "corrupted". Table XML rewritten from minimal skeleton to full HWPX-spec form — all 10 required `<hp:tbl>` attributes + `<hp:sz>`/`<hp:pos>`/`<hp:outMargin>`/`<hp:inMargin>`, each `<hp:tc>` wrapped in `<hp:subList>` with `<hp:cellAddr>`/`<hp:cellSpan>`/`<hp:cellSz>`/`<hp:cellMargin>`, paragraph-anchored placement. Added `Preview/PrvText.txt` + `borderFill` id=1 (SOLID 0.12mm).
+- **🔓 HWP 5.x Distribution COM Fallback (#25)** — `.hwp` binaries that only return the "상위 버전의 배포용 문서입니다..." warning placeholder now automatically retry via `HWPFrame.HwpObject` COM API on Windows + Hancom Office. Extends v2.4.0's HWPX DRM fallback infrastructure to `.hwp` files.
+
+<details>
+<summary>v2.4.0 changes</summary>
 
 - **🔓 HWPX DRM Document Auto-Extraction** — Automatically extracts text from DRM-protected HWPX files (Korean government distribution documents). Detects `encryption-data` in `manifest.xml` → opens via Hancom Office COM API (`HWPFrame.HwpObject`) → extracts text page-by-page using `GetPageText` → converts to Markdown. Works automatically on Windows with Hancom Office installed.
+
+</details>
 
 <details>
 <summary>v2.3.0 changes</summary>
